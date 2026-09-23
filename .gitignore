@@ -1,0 +1,21 @@
+# 虚拟环境
+.venv/
+__pycache__/
+*.pyc
+
+# 本机配置（含绝对路径）；只提交 config.example.json
+config.json
+
+# 索引数据库（正常放在 %LOCALAPPDATA%\kb-mcp\，此处兜底）
+*.db
+*.db-journal
+*.db-wal
+
+# 模型文件（约 100MB，由 scripts/fetch_model.py 下载）
+models/*/
+!models/.gitkeep
+
+# 本地产出与日志
+logs/
+out/
+*.log

@@ -1,0 +1,51 @@
+{
+  "server": {
+    "name": "kb-mcp",
+    "version": "0.1.0",
+    "log_file": ""
+  },
+  "db_path": "",
+  "sources": [
+    {
+      "id": "dufuzhixin",
+      "label": "独夫之心语音转录",
+      "root": "C:\\Users\\Ronnie\\Documents\\GitHub\\dufuzhixin",
+      "include": [
+        "**/dufu-BV*.md"
+      ],
+      "exclude": [
+        "**/.git/**"
+      ],
+      "read_only": true,
+      "clean": true
+    }
+  ],
+  "scan": {
+    "stale_check_seconds": 300,
+    "max_file_bytes": 8000000,
+    "min_body_chars": 30
+  },
+  "chunk": {
+    "size": 350,
+    "overlap": 80
+  },
+  "embed": {
+    "enabled": true,
+    "model_dir": "",
+    "model_file": "",
+    "dim": 512,
+    "max_tokens": 512,
+    "batch": 32,
+    "query_prefix": "为这个句子生成表示以用于检索相关文章：",
+    "doc_prefix": ""
+  },
+  "search": {
+    "rrf_k": 60,
+    "default_top_k": 8,
+    "max_top_k": 50,
+    "fts_candidates": 200,
+    "vector_candidates": 200,
+    "snippet_chars": 240,
+    "max_terms": 16
+  }
+}
