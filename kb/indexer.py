@@ -16,6 +16,21 @@ from . import store, textproc
 
 SKIP_DIRS = {".git", ".venv", "node_modules", "__pycache__", ".idea", ".vscode"}
 
+LOCK_MESSAGE = ("索引已锁定：scan.auto_index=false。"
+                "这是第二步安全开关——用户确认资料修复完毕后，"
+                "把 config.json 里 scan.auto_index 改为 true 才会读取源库并建向量。")
+
+
+def indexing_locked(cfg: dict) -> bool:
+    """第二步安全开关。true 表示禁止任何读取源库/建索引/算向量的动作。"""
+    return not bool((cfg.get("scan") or {}).get("auto_index", True))
+
+
+def _locked_result(st: dict) -> dict:
+    st.update({"locked": True, "reason": "auto_index=false", "message": LOCK_MESSAGE,
+               "head_changed": False})
+    return st
+
 
 # ---------- 源文件枚举（只读） ----------
 
@@ -93,6 +108,12 @@ def read_bytes(path: str, max_bytes: int) -> bytes:
 def index_source(conn, cfg, src: dict, embedder=None, full: bool = False,
                  progress=None, job_id: str | None = None,
                  budget_seconds: float | None = None) -> dict:
+    st = {"source": src["id"], "total": 0, "new": 0, "updated": 0, "unchanged": 0,
+          "removed": 0, "dead": 0, "empty": 0, "errors": 0, "chunks": 0, "embedded": 0,
+          "head_before": "", "head_after": "", "budget_hit": False,
+          "dead_files": [], "error_files": [], "locked": False}
+    if indexing_locked(cfg):
+        return _locked_result(st)
     t_start = time.time()
     scan = cfg.get("scan", {})
     max_bytes = int(scan.get("max_file_bytes", 8_000_000))
@@ -109,7 +130,7 @@ def index_source(conn, cfg, src: dict, embedder=None, full: bool = False,
     st = {"source": src["id"], "total": len(files), "new": 0, "updated": 0, "unchanged": 0,
           "removed": 0, "dead": 0, "empty": 0, "errors": 0, "chunks": 0, "embedded": 0,
           "head_before": head_before, "head_after": head_before, "budget_hit": False,
-          "dead_files": [], "error_files": []}
+          "dead_files": [], "error_files": [], "locked": False}
 
     seen = set()
     for i, f in enumerate(files):
@@ -249,6 +270,10 @@ def scan_changes(cfg, conn) -> dict:
 def ensure_fresh(conn, cfg, embedder=None, force: bool = False,
                  budget_seconds: float | None = 60.0) -> dict:
     """发现源库比索引新就地重建（增量）。查询路径调用，保证结果不过期。"""
+    if indexing_locked(cfg):
+        # 安全开关：连源库目录都不遍历，直接返回锁定态
+        return {"checked": False, "reason": "locked", "locked": True,
+                "reindexed": False, "stale": None, "message": LOCK_MESSAGE, "runs": []}
     throttle = float(cfg.get("scan", {}).get("stale_check_seconds", 300))
     last_walk = float(store.meta_get(conn, "last_walk_ts", 0) or 0)
     now = time.time()
@@ -257,7 +282,7 @@ def ensure_fresh(conn, cfg, embedder=None, force: bool = False,
                 "seconds_since_walk": int(now - last_walk),
                 "reindexed": False, "throttle_seconds": int(throttle)}
     diff = scan_changes(cfg, conn)
-    out = {"checked": True, "reindexed": False, "stale": diff["stale"],
+    out = {"checked": True, "reindexed": False, "stale": diff["stale"], "locked": False,
            "source_files": diff["files"], "per_source": diff["per_source"],
            "new": len(diff["new"]), "changed": len(diff["changed"]), "removed": len(diff["removed"]),
            "last_index_ts": float(store.meta_get(conn, "last_index_ts", 0) or 0), "runs": []}

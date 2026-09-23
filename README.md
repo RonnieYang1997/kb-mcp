@@ -68,6 +68,11 @@ C:\Users\Ronnie\Documents\GitHub\kb-mcp\bin\kb_serve.py
 
 ## 三、索引怎么保持新鲜
 
+> **第二步安全开关**：`config.json` 里 `scan.auto_index` 是总闸。
+> 为 `false` 时，上面三条路径（事件驱动 / 惰性兜底 / 手动 `reindex`）**全部立即返回锁定态**，
+> 连源库目录都不遍历、不建片段、不算向量（`kb index` 退出码 `4`，`reindex` 返回 `"locked": true`）。
+> 只有用户确认资料修复完毕、把该值改为 `true`（见第五节第 0 步），才会真正读取源库。
+
 三层，缺一不可：
 
 1. **事件驱动**：`daily_scan.py` 尾部调用 `bin/kb_index.py`（增量）。
@@ -109,6 +114,10 @@ Top-1 检索结果 **100% 一致**，Top-5 平均重合 **86.7%**。
 > 前提：确认资料修复完毕。
 
 ```powershell
+# 0) 解锁索引（把 scan.auto_index 改成 true；这是唯一的放行开关）
+#    编辑 config.json： "scan": { "auto_index": true, ... }
+& $kb -m kb doctor          # 应打印 [索引开关] auto_index=true
+
 # 1) 先让全文检索可用（约 1 分钟）
 & $kb -m kb index --fts-only
 
@@ -136,12 +145,14 @@ config.json          本机配置（绝对路径，不进 git）
 
 ## 七、已验证（第一步交付时跑过）
 
-`python tools/selftest.py` → **36/36 PASS**，含：
+`python tools/selftest.py` → **39/39 PASS**，含：
 
 - 清洗：BOM、GBK 乱码表头、乱码小标题在索引里彻底消失，正文完整保留；
 - 失效正文识别：JSON `upstream_error` / HTML 5xx → 标记 `dead` 且不产生片段；
 - 检索：全文命中、向量命中、RRF 分数降序、混合结果两个来源都有贡献；
 - `fetch` 取全文；陈旧检查能发现改动并自动补索引、节流生效；
+- **第二步安全开关**：`auto_index=false` 时 `ensure_fresh` 与 `index_source` 均直接返回锁定，
+  不遍历源库、不建索引、不算向量、文档数不变；
 - **源库三重证据未变**：源文件 sha1、mtime、`.git/HEAD` 全部未变；
 - **MCP 协议**：initialize 握手、tools/list 返回 5 个工具、五个工具调用全部成功、
   未知工具返回 JSON-RPC 错误不崩溃、exit 正常退出、stdout 无非协议污染。

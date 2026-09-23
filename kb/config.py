@@ -54,6 +54,11 @@ def load() -> dict:
     if not emb.get("model_dir"):
         emb["model_dir"] = default_model_dir()
 
+    # 第二步安全开关：auto_index=false 时任何路径都不读源库、不建索引、不算向量。
+    # 只有用户明确放行（「资料修复完毕，可以进行」）后才在 config.json 里改成 true。
+    scan = cfg.setdefault("scan", {})
+    scan.setdefault("auto_index", True)
+
     for s in cfg.get("sources", []):
         s.setdefault("id", Path(s["root"]).name)
         s.setdefault("label", s["id"])

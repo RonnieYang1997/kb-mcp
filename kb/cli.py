@@ -35,6 +35,16 @@ def cmd_serve(args) -> int:
 def cmd_index(args) -> int:
     cfg = cfgmod.load()
     conn = _open_store(cfg)
+    if indexer.indexing_locked(cfg):
+        # 第二步安全开关：不读源库、不建索引、不算向量
+        if args.job_id:
+            store.job_finish(conn, args.job_id, "skipped_locked", indexer.LOCK_MESSAGE)
+        print("[kb index] " + indexer.LOCK_MESSAGE, file=sys.stderr)
+        if not args.quiet:
+            print(json.dumps({"locked": True, "reason": "auto_index=false",
+                              "message": indexer.LOCK_MESSAGE,
+                              "counts": store.counts(conn)}, ensure_ascii=False, indent=2))
+        return 4
     emb = None if getattr(args, "fts_only", False) else embed_mod.load_from_config(cfg)
     if emb is None:
         print("[kb index] --fts-only：本次不向量化（向量可稍后由 reindex 补齐）")
@@ -117,15 +127,19 @@ def cmd_stats(args) -> int:
            "model": embed_mod.model_status(cfg), "db_path": cfg["db_path"],
            "last_index_ts": store.meta_get(conn, "last_index_ts"),
            "recent_jobs": store.recent_jobs(conn, 5)}
-    try:
-        diff = indexer.scan_changes(cfg, conn)
-        out["source_files"] = diff["files"]
-        out["per_source"] = diff["per_source"]
-        out["stale"] = diff["stale"]
-        out["pending_changes"] = {"new": len(diff["new"]), "changed": len(diff["changed"]),
-                                  "removed": len(diff["removed"])}
-    except Exception as e:
-        out["scan_error"] = f"{type(e).__name__}: {e}"
+    out["indexing_locked"] = indexer.indexing_locked(cfg)
+    if out["indexing_locked"]:
+        out["note"] = indexer.LOCK_MESSAGE
+    else:
+        try:
+            diff = indexer.scan_changes(cfg, conn)
+            out["source_files"] = diff["files"]
+            out["per_source"] = diff["per_source"]
+            out["stale"] = diff["stale"]
+            out["pending_changes"] = {"new": len(diff["new"]), "changed": len(diff["changed"]),
+                                      "removed": len(diff["removed"])}
+        except Exception as e:
+            out["scan_error"] = f"{type(e).__name__}: {e}"
     _out(out, as_json=True)
     return 0
 
@@ -216,11 +230,13 @@ def cmd_doctor(args) -> int:
     info["model"]["loadable"] = emb.available
     info["model"]["reason"] = emb.reason
     # 源库 HEAD 快照（纯文件读取）
+    info["indexing_locked"] = indexer.indexing_locked(cfg)
     info["sources"] = []
     for s in cfg.get("sources", []):
-        files = indexer.iter_files(s)
+        files = None if info["indexing_locked"] else indexer.iter_files(s)
         info["sources"].append({
-            "id": s["id"], "root": s["root"], "files": len(files),
+            "id": s["id"], "root": s["root"],
+            "files": (len(files) if files is not None else None),
             "head": indexer.git_head(s["root"]),
             "head_at_index": store.meta_get(conn, f"head:{s['id']}", ""),
             "read_only": s.get("read_only", True), "clean": s.get("clean", True),
@@ -229,6 +245,10 @@ def cmd_doctor(args) -> int:
     print("\n[只读自审] " + ("干净：无未解释的写操作" if info["audit"]["clean"]
                           else f"发现 {len(info['audit']['unexplained'])} 处未解释的写操作，请核对"),
           file=sys.stderr)
+    if info["indexing_locked"]:
+        print("[索引开关] " + indexer.LOCK_MESSAGE, file=sys.stderr)
+    else:
+        print("[索引开关] auto_index=true —— 已允许读取源库并建立索引", file=sys.stderr)
     return 0
 
 

@@ -205,7 +205,10 @@ def t_search(ctx: Ctx, args: dict) -> dict:
 def _fresh_brief(ctx: Ctx) -> dict:
     info = ctx.fresh_info or {}
     brief = {"reindexed": info.get("reindexed", False)}
-    if info.get("checked") is False:
+    if info.get("locked"):
+        brief["locked"] = True
+        brief["stale_check"] = indexer.LOCK_MESSAGE
+    elif info.get("checked") is False:
         brief["stale_check"] = "节流跳过（%.0fs 内已检查过）" % info.get("seconds_since_walk", 0)
     return brief
 
@@ -310,6 +313,10 @@ def t_reindex(ctx: Ctx, args: dict) -> dict:
     source = args.get("source")
     wait = int(args.get("wait_seconds") or 60)
     cfg = ctx.cfg
+    if indexer.indexing_locked(cfg):
+        return {"ok": False, "locked": True, "mode": "full" if full else "incremental",
+                "runs": [], "message": indexer.LOCK_MESSAGE,
+                "hint": "第二步安全开关生效中；用户确认资料修复完毕后把 config.json 的 scan.auto_index 改为 true。"}
     if full and bool(args.get("background", True)):
         jid = store.job_start(ctx.conn, "full-reindex", 0, "排队中（后台进程）")
         script = ROOT / "bin" / "kb_index.py"

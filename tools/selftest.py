@@ -158,6 +158,23 @@ def main() -> int:
     again = indexer.ensure_fresh(conn, cfg, embedder=emb)   # 节流
     check(again.get("checked") is False, "节流生效（短时间内不重复扫描）")
 
+    print("\n== 6b. 第二步安全开关 (scan.auto_index=false) ==")
+    import copy as _copy
+    locked = _copy.deepcopy(cfg)
+    locked["scan"]["auto_index"] = False
+    docs_before = store.counts(conn)["docs"]
+    lk = indexer.ensure_fresh(conn, locked, embedder=emb, force=True)
+    check(lk.get("locked") is True and lk.get("reindexed") is False
+          and lk.get("checked") is False,
+          "auto_index=false → ensure_fresh 直接返回锁定，不读源库",
+          f"reason={lk.get('reason')}")
+    lk2 = indexer.index_source(conn, locked, locked["sources"][0], embedder=emb, full=True)
+    check(lk2.get("locked") is True and lk2.get("total") == 0
+          and lk2.get("chunks") == 0 and lk2.get("embedded") == 0,
+          "auto_index=false → index_source 不遍历不建索引",
+          f"total={lk2.get('total')} chunks={lk2.get('chunks')} embedded={lk2.get('embedded')}")
+    check(store.counts(conn)["docs"] == docs_before, "锁定期间文档数不变")
+
     print("\n== 7. 源库未被改动（三重证据） ==")
     left = [(p, sha1(p) != src_sha_before[p]) for p in fx["source_files"]]
     check(not any(ch for _, ch in left), "被复制的源文件 sha1 未变",

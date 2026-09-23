@@ -21,6 +21,7 @@
     }
   ],
   "scan": {
+    "auto_index": true,
     "stale_check_seconds": 300,
     "max_file_bytes": 8000000,
     "min_body_chars": 30
