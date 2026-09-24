@@ -67,8 +67,9 @@ def tool_defs() -> list[dict]:
         {
             "name": "search",
             "description": ("在本地转录语料里做混合检索（中文全文 + 向量，RRF 融合）。"
-                            "返回带出处的片段：标题/日期/BVID/文件路径/片段序号。"
-                            "需要完整内容时用返回值里的 doc_id 调 fetch。"),
+                            "返回带出处的片段：标题/日期/BVID/文件路径/片段序号，"
+                            "每条结果都带 chunk_id 与 doc_id。"
+                            "要看完整上下文就把 chunk_id 交给 fetch（会自动对准命中位置）。"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -85,11 +86,15 @@ def tool_defs() -> list[dict]:
         },
         {
             "name": "fetch",
-            "description": ("按 doc_id / 文件路径 / BVID 取一篇转录的完整正文（已做只读清洗），"
-                            "用于整理与总结。大文件可配合 offset/max_chars 分段取。"),
+            "description": ("取一篇转录的完整正文（已做只读清洗），用于整理与总结。"
+                            "最常用：把 search 结果里的 chunk_id 丢进来，会自动定位到该片段所在文档、"
+                            "并把返回窗口对准命中位置（前后各留上下文）。也支持 doc_id / 路径 / BVID。"
+                            "大文件可配合 offset/max_chars 分段取。"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "chunk_id": {"type": "integer",
+                                 "description": "search 结果里的 chunk_id，最推荐的用法"},
                     "doc_id": {"type": "integer", "description": "search/list_documents 返回的 doc_id"},
                     "path": {"type": "string", "description": "相对资料库的路径，如 memory/dufu-BV1xx.md"},
                     "bvid": {"type": "string", "description": "BVID，如 BV1JUN76wECw"},
@@ -217,17 +222,38 @@ def _fresh_brief(ctx: Ctx) -> dict:
 
 
 def t_fetch(ctx: Ctx, args: dict) -> dict:
-    doc = _resolve_doc(ctx.conn, args.get("doc_id"), args.get("path"), args.get("bvid"))
+    # 支持直接用 search 返回的 chunk_id：自动定位到该片段所在文档，并把正文窗口对准这个片段
+    cid = args.get("chunk_id")
+    doc = None
+    anchor = ""
+    chunk_seq = None
+    if cid:
+        try:
+            m = store.doc_of_chunk(ctx.conn, [int(cid)]).get(int(cid))
+        except (TypeError, ValueError):
+            m = None
+        if not m:
+            return {"error": f"chunk_id={cid} 不存在（可能是旧索引，请重新 search）"}
+        doc = _resolve_doc(ctx.conn, m["doc_id"])
+        anchor = (m.get("text") or "")[:60]
+        chunk_seq = m.get("seq")
     if not doc:
-        return {"error": "未找到对应文档；请先用 search 或 list_documents 取 doc_id/path/bvid"}
+        doc = _resolve_doc(ctx.conn, args.get("doc_id"), args.get("path"), args.get("bvid"))
+    if not doc:
+        return {"error": "未找到对应文档；请先用 search 或 list_documents 取 chunk_id/doc_id/path/bvid"}
     max_chars = int(args.get("max_chars") or 20000)
     offset = max(0, int(args.get("offset") or 0))
     if not os.path.exists(doc["abs_path"]):
         return {"error": f"源文件已不存在: {doc['rel_path']}（可能已被移动，索引需要刷新）"}
     body, m = _doc_text(ctx.cfg, doc["source_id"], doc["abs_path"])
+    if anchor:
+        idx = body.find(anchor)
+        if idx >= 0:
+            offset = max(0, idx - min(120, max_chars // 3))   # 片段前留一点上下文
     piece = body[offset:offset + max_chars]
     return {
-        "doc_id": doc["id"], "title": doc["title"], "bvid": doc["bvid"], "date": doc["date"],
+        "doc_id": doc["id"], "chunk_id": int(cid) if cid else None, "chunk_seq": chunk_seq,
+        "title": doc["title"], "bvid": doc["bvid"], "date": doc["date"],
         "duration": doc["duration"], "source": doc["source_id"], "path": doc["rel_path"],
         "state": doc["state"], "total_chars": len(body), "offset": offset,
         "returned_chars": len(piece), "has_more": offset + max_chars < len(body),
@@ -263,13 +289,13 @@ def t_list_documents(ctx: Ctx, args: dict) -> dict:
     total = ctx.conn.execute(f"SELECT COUNT(*) FROM docs WHERE {cond}", params).fetchone()[0]
     rows = []
     for r in ctx.conn.execute(
-            f"""SELECT id, source_id, rel_path, title, bvid, date, duration, n_chunks, state, note
+            f"""SELECT id, source_id, rel_path, title, bvid, date, duration, n_chunks, state, note, size, mtime
                 FROM docs WHERE {cond} ORDER BY {order} LIMIT ? OFFSET ?""",
             params + [limit, offset]):
         rows.append({"doc_id": r["id"], "source": r["source_id"], "path": r["rel_path"],
                      "title": r["title"], "bvid": r["bvid"], "date": r["date"],
                      "duration": r["duration"], "chunks": r["n_chunks"], "state": r["state"],
-                     "note": r["note"]})
+                     "bytes": r["size"], "mtime": r["mtime"], "note": r["note"]})
     return {"total": total, "returned": len(rows), "limit": limit, "offset": offset,
             "ordering": order, "documents": rows, "index": _fresh_brief(ctx)}
 
