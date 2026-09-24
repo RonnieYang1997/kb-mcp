@@ -135,7 +135,7 @@ Top-1 检索结果 **100% 一致**，Top-5 平均重合 **86.7%**。
 bin/        入口脚本（kb_serve.py 供 AionUi 拉起；kb_index.py 供 daily_scan 调用）
 kb/         实现：config / textproc / store / embed / search / indexer / server / cli / audit
 scripts/    fetch_model.py：从 hf-mirror 或 ModelScope 拉取 ONNX 模型并校验
-tools/      selftest.py 端到端自测 · audit_readonly.py 只读自审 · bench_embed.py 性能基准
+tools/      selftest.py 端到端自测 · health_check.py 索引体检 · audit_readonly.py 只读自审 · bench_embed.py 性能基准
             estimate.py 规模预估 · compare_models.py 模型取舍对比
 config.example.json  默认配置（含源库定义，提交进 git）
 config.json          本机配置（绝对路径，不进 git）
@@ -145,7 +145,7 @@ config.json          本机配置（绝对路径，不进 git）
 
 ## 七、已验证（第一步交付时跑过）
 
-`python tools/selftest.py` → **39/39 PASS**，含：
+`python tools/selftest.py` → **44/44 PASS**，含：
 
 - 清洗：BOM、GBK 乱码表头、乱码小标题在索引里彻底消失，正文完整保留；
 - 失效正文识别：JSON `upstream_error` / HTML 5xx → 标记 `dead` 且不产生片段；
@@ -156,3 +156,19 @@ config.json          本机配置（绝对路径，不进 git）
 - **源库三重证据未变**：源文件 sha1、mtime、`.git/HEAD` 全部未变；
 - **MCP 协议**：initialize 握手、tools/list 返回 5 个工具、五个工具调用全部成功、
   未知工具返回 JSON-RPC 错误不崩溃、exit 正常退出、stdout 无非协议污染。
+
+## 八、健壮性：几处"看起来没事、其实会咬人"的地方
+
+| 场景 | 行为 |
+|---|---|
+| 后台全量任务跑到一半被杀/断电 | 下次索引自动**补上缺向量的片段**（片段落盘与向量写入是两个事务，本来会留下"搜得到、向量搜不到"的空洞） |
+| 换了 `embed.model_file`（int8 ↔ fp32）却没重建 | 检测到向量模型标识变化 → **只更新全文、拒绝混写向量**，并在 `index_log` 记警告；需 `--full` 重建 |
+| 索引库里混了两种维度/模型的向量 | `load_vectors` 只取占多数的那一种（按 blob 长度盲目 reshape 会**静默算错**相似度） |
+| 被强杀的任务留下 `running` 状态 | 依据「工作进程 pid 是否存活 + 15 分钟心跳」自动标记 `interrupted`，不会永久挡住后续索引 |
+| `reindex` 撞上正在跑的任务 | 返回「已有任务」+ 进度，不抢写锁；`force=true` 才强排队 |
+| `full: "false"` / `"no"` / `0` | 严格布尔转换 → **不会**误触发数小时的全量重建 |
+| 空查询 / 纯标点查询 | 返回空结果 + 说明，而不是拿空串去算向量得到一堆"看着像结果"的随机片段 |
+| `top_k: "abc"`、未知 `mode`、未知 `source` | 参数容错（钳位/回退 hybrid/明确报错），不把 Python 异常泄漏给调用方 |
+
+`python tools/health_check.py` 是只读体检（11 项）：片段与全文行数一致、无孤儿全文行、
+每个片段都有向量、维度/范数统一、向量只来自一个模型、HEAD 与索引时一致、与源库无差异。
