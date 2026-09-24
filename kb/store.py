@@ -209,8 +209,9 @@ def log_index(conn, source_id: str, rel_path: str, action: str, result: str,
                  (now(), source_id, rel_path, action, result, note, ms))
 
 
-def job_start(conn, kind: str, total: int = 0, message: str = "") -> str:
-    jid = uuid.uuid4().hex[:12]
+def job_start(conn, kind: str, total: int = 0, message: str = "", jid: str = "") -> str:
+    """建一条 running 任务。传 jid 时用调用方给的 id（后台全量任务用固定 id 便于查询）。"""
+    jid = jid or uuid.uuid4().hex[:12]
     conn.execute("INSERT INTO jobs(id,kind,status,started_at,total,done,message) VALUES(?,?,?,?,?,?,?)",
                  (jid, kind, "running", now(), total, 0, message))
     conn.commit()

@@ -49,10 +49,23 @@ def cmd_index(args) -> int:
     if emb is None:
         print("[kb index] --fts-only：本次不向量化（向量可稍后由 reindex 补齐）")
     job_id = getattr(args, "job_id", None)
+    if job_id and not store.job_get(conn, job_id):
+        n_files = 0
+        for src in cfg.get("sources", []):
+            if args.source and src["id"] != args.source:
+                continue
+            try:
+                n_files += len(indexer.iter_files(src))
+            except Exception:
+                pass
+        store.job_start(conn, "full" if args.full else "incremental", total=n_files, jid=job_id,
+                        message=f"{'全量' if args.full else '增量'}索引开始，共 {n_files} 篇"
+                                + ("，含向量化" if emb is not None else "，仅全文"))
+        store.job_update(conn, job_id, status="running")
     if not args.quiet:
         print(f"[kb index] full={args.full} source={args.source or '*'}")
         print(f"[kb index] db={cfg['db_path']}")
-        print(f"[kb index] embed={'ok' if emb.available else 'unavailable: ' + emb.reason}")
+        print(f"[kb index] embed={'off (--fts-only)' if emb is None else ('ok' if emb.available else 'unavailable: ' + emb.reason)}")
     t0 = time.time()
     runs = []
     for src in cfg.get("sources", []):
@@ -63,12 +76,19 @@ def cmd_index(args) -> int:
             if not args.quiet:
                 print(f"  .. {src['id']} {i}/{total} new={st['new']} upd={st['updated']} "
                       f"dead={st['dead']} err={st['errors']}", flush=True)
+            if job_id and (i % 25 == 0 or i == total):
+                store.job_update(conn, job_id, done=i, total=total, status="running",
+                                 message=f"{src['id']} {i}/{total} 新增{st['new']} 更新{st['updated']} "
+                                         f"片段{st['chunks']} 向量{st['embedded']}")
 
         runs.append(indexer.index_source(conn, cfg, src, embedder=emb, full=args.full,
                                          progress=progress, job_id=job_id,
                                          budget_seconds=args.budget or None))
         if job_id:
-            store.job_update(conn, job_id, done=1, message=f"{src['id']} 完成")
+            _r = runs[-1]
+            store.job_update(conn, job_id, done=_r.get("total", 0),
+                             message=f"{src['id']} 完成：新增{_r['new']} 更新{_r['updated']} "
+                                     f"片段{_r['chunks']} 向量{_r['embedded']}")
     total_ms = int((time.time() - t0) * 1000)
     summary = {"runs": [{k: v for k, v in r.items() if k not in ("dead_files", "error_files")} for r in runs],
                "took_ms": total_ms, "counts": store.counts(conn)}

@@ -205,7 +205,10 @@ def t_search(ctx: Ctx, args: dict) -> dict:
 def _fresh_brief(ctx: Ctx) -> dict:
     info = ctx.fresh_info or {}
     brief = {"reindexed": info.get("reindexed", False)}
-    if info.get("locked"):
+    if info.get("busy_job"):
+        brief["pending"] = True
+        brief["stale_check"] = f"后台任务 {info['busy_job']} 正在建索引，本次未抢写锁"
+    elif info.get("locked"):
         brief["locked"] = True
         brief["stale_check"] = indexer.LOCK_MESSAGE
     elif info.get("checked") is False:
@@ -317,6 +320,18 @@ def t_reindex(ctx: Ctx, args: dict) -> dict:
         return {"ok": False, "locked": True, "mode": "full" if full else "incremental",
                 "runs": [], "message": indexer.LOCK_MESSAGE,
                 "hint": "第二步安全开关生效中；用户确认资料修复完毕后把 config.json 的 scan.auto_index 改为 true。"}
+    # 已有后台任务在跑时不要并发写同一个索引库（SQLite 单写者）
+    if not args.get("force"):
+        running = [j for j in store.recent_jobs(ctx.conn, 5) if j.get("status") == "running"]
+        if running:
+            j = running[0]
+            return {"ok": False, "busy": True, "mode": "full" if full else "incremental",
+                    "running_job": {"id": j["id"], "kind": j["kind"], "done": j["done"],
+                                    "total": j["total"], "message": j["message"],
+                                    "started_at": j["started_at"]},
+                    "message": f"已有任务 {j['id']} 正在运行（{j['done']}/{j['total']}），"
+                               "为避免索引库写冲突，本次未执行。",
+                    "hint": "等它跑完，或传 force=true 强行排队（会等锁，可能很慢）。"}
     if full and bool(args.get("background", True)):
         jid = store.job_start(ctx.conn, "full-reindex", 0, "排队中（后台进程）")
         script = ROOT / "bin" / "kb_index.py"
@@ -332,7 +347,8 @@ def t_reindex(ctx: Ctx, args: dict) -> dict:
         subprocess.Popen(cmd, **kwargs)
         return {"mode": "full", "background": True, "job_id": jid,
                 "log": str(logf / f"index-{jid}.log"),
-                "hint": "全量重建在后台进行（预计 10–25 分钟）。用 stats 查看 recent_jobs 进度。"}
+                "hint": "全量重建在后台进行（实测约 2.3 小时：5.7 万片段向量化；文本部分约 1 分钟）。"
+                        "用 stats 查看 recent_jobs 的 done/total 与 log 文件。"}
     t0 = time.time()
     runs = []
     for s in cfg.get("sources", []):

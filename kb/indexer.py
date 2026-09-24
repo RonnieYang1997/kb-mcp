@@ -187,10 +187,13 @@ def index_source(conn, cfg, src: dict, embedder=None, full: bool = False,
             store.delete_doc_content(conn, doc_id)
             cids = store.insert_chunks(conn, doc_id, chunks)
             st["chunks"] += len(chunks)
+            # 先落盘：绝不能把 SQLite 写锁压在慢速的向量化上（否则并发任务会 database is locked）
+            conn.commit()
             if chunks and embedder is not None and getattr(embedder, "available", False):
                 vec = embedder.encode(chunks, prefix=cfg.get("embed", {}).get("doc_prefix", ""))
                 store.insert_embeddings(conn, cids, vec, embedder.model_id)
                 st["embedded"] += len(cids)
+                conn.commit()   # 向量单独短事务
             st["new" if not prev else "updated"] += 1
             store.log_index(conn, src["id"], f["rel"],
                             "add" if not prev else "update", state,
@@ -287,6 +290,12 @@ def ensure_fresh(conn, cfg, embedder=None, force: bool = False,
            "new": len(diff["new"]), "changed": len(diff["changed"]), "removed": len(diff["removed"]),
            "last_index_ts": float(store.meta_get(conn, "last_index_ts", 0) or 0), "runs": []}
     if force or diff["stale"]:
+        running = [j for j in store.recent_jobs(conn, 3) if j.get("status") == "running"]
+        if running:
+            # 已有后台任务在写索引库：本次不抢写锁，只报告"待补"
+            out["busy_job"] = running[0]["id"]
+            out["pending"] = True
+            return out
         for src in cfg.get("sources", []):
             res = index_source(conn, cfg, src, embedder=embedder, full=False,
                                budget_seconds=budget_seconds)

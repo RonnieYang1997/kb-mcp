@@ -131,16 +131,21 @@ def model_status(cfg: dict) -> dict:
     emb = cfg.get("embed", {})
     d = Path(emb.get("model_dir", ""))
     files = {}
+    missing = []
     for name in ("tokenizer.json", "model.onnx", "onnx/model.onnx",
                  "onnx/model_quantized.onnx", emb.get("model_file", "")):
         if not name:
             continue
         p = d / name
-        files[name] = p.stat().st_size if p.exists() else 0
+        if p.exists():
+            files[name] = p.stat().st_size
+        else:
+            missing.append(name)
     return {
         "model_dir": str(d),
         "exists": d.exists(),
         "files": files,
+        "missing": missing,
         "model_file_config": emb.get("model_file", "") or "(自动：优先 model.onnx)",
         "total_bytes": sum(files.values()),
         "enabled": bool(emb.get("enabled", True)),

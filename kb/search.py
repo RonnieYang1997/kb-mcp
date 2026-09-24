@@ -167,9 +167,21 @@ def search(conn, cfg: dict, query: str, embedder=None, top_k: int | None = None,
             "cosine": round(vec_sim[cid], 4) if cid in vec_sim else None,
             "snippet": textproc.snippet(m["text"], snip_len),
         })
+    # 实际生效的模式（而不是请求的模式）：向量库还没建时别谎报 hybrid
+    if fts_rows and vec_rows:
+        effective = "hybrid"
+    elif vec_rows:
+        effective = "vector"
+    elif fts_rows:
+        effective = "fts"
+    else:
+        effective = mode + "(no-hit)"
+    if mode == "hybrid" and not vec_rows and fts_rows:
+        notes.append("向量检索暂无可比数据（索引尚未补齐），本次结果全部来自全文检索")
     return {
         "query": query,
-        "mode": mode,
+        "mode": effective,
+        "mode_requested": mode,
         "top_k": top_k,
         "candidates": {"fts": len(fts_rows), "vector": len(vec_rows)},
         "took_ms": int((time.time() - t0) * 1000),
