@@ -6,7 +6,9 @@
 """
 from __future__ import annotations
 
+import datetime
 import json
+import os
 import sqlite3
 import time
 import uuid
@@ -50,7 +52,7 @@ CREATE INDEX IF NOT EXISTS idx_log_ts ON index_log(ts);
 
 CREATE TABLE IF NOT EXISTS jobs(
   id TEXT PRIMARY KEY, kind TEXT, status TEXT, started_at TEXT, finished_at TEXT,
-  total INTEGER, done INTEGER, message TEXT);
+  total INTEGER, done INTEGER, message TEXT, pid INTEGER DEFAULT 0, updated_at TEXT DEFAULT '');
 """
 
 
@@ -66,6 +68,12 @@ def connect(db_path: str) -> sqlite3.Connection:
 
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    # 老库平滑迁移：jobs 表补 pid / updated_at（用于判断后台任务是否还活着）
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
+    if "pid" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN pid INTEGER DEFAULT 0")
+    if "updated_at" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN updated_at TEXT DEFAULT ''")
     conn.commit()
 
 
@@ -163,24 +171,43 @@ def insert_embeddings(conn, chunk_ids: list[int], mat: np.ndarray, model: str) -
 
 
 def load_vectors(conn, where: str = "", params: tuple = ()) -> tuple[list[int], np.ndarray]:
-    """返回 (chunk_id 列表, 归一化向量矩阵)。"""
-    sql = ("SELECT e.chunk_id AS cid, e.vec AS vec, e.dim AS dim FROM embeddings e "
-           "JOIN chunks c ON c.id=e.chunk_id JOIN docs d ON d.id=c.doc_id ")
+    """返回 (chunk_id 列表, 归一化向量矩阵)。
+
+    只取"占多数"的那一个模型+维度：索引库里一旦混进两种向量（换模型后没重建），
+    按 blob 长度盲目 reshape 会静默算出错误的相似度，宁可少取也不能算错。
+    """
+    dominant = conn.execute(
+        "SELECT model, dim FROM embeddings GROUP BY model, dim "
+        "ORDER BY COUNT(*) DESC LIMIT 1").fetchone()
+    if dominant is None:
+        return [], np.zeros((0, 512), dtype=np.float32)
+    sql = ("SELECT e.chunk_id AS cid, e.vec AS vec FROM embeddings e "
+           "JOIN chunks c ON c.id=e.chunk_id JOIN docs d ON d.id=c.doc_id "
+           "WHERE e.model = ? AND e.dim = ? ")
+    args = [dominant["model"], dominant["dim"]]
     if where:
-        sql += "WHERE " + where + " "
+        sql += "AND " + where + " "
     sql += "ORDER BY e.chunk_id"
     ids: list[int] = []
     blobs: list[bytes] = []
-    dim = None
-    for r in conn.execute(sql, params):
+    for r in conn.execute(sql, args + list(params)):
         ids.append(r["cid"])
         blobs.append(r["vec"])
-        dim = r["dim"] or dim
     if not ids:
-        return [], np.zeros((0, dim or 512), dtype=np.float32)
+        return [], np.zeros((0, int(dominant["dim"]) or 512), dtype=np.float32)
+    size = len(blobs[0])
+    if size % 4 or any(len(b) != size for b in blobs):
+        raise RuntimeError(f"向量 blob 长度不一致（首个 {size} 字节），索引库可能损坏或被混入不同维度")
     mat = np.frombuffer(b"".join(blobs), dtype=np.float32)
-    mat = mat.reshape(len(blobs), -1)
+    mat = mat.reshape(len(blobs), size // 4)
     return ids, mat
+
+
+def embeddings_model_info(conn) -> dict:
+    """索引库里现存的向量模型分布（用于 stats / 一致性告警）。"""
+    rows = [dict(r) for r in conn.execute(
+        "SELECT model, dim, COUNT(*) AS n FROM embeddings GROUP BY model, dim ORDER BY n DESC")]
+    return {"distinct": len(rows), "groups": rows}
 
 
 def doc_of_chunk(conn, chunk_ids: list[int]) -> dict[int, dict]:
@@ -212,24 +239,83 @@ def log_index(conn, source_id: str, rel_path: str, action: str, result: str,
 def job_start(conn, kind: str, total: int = 0, message: str = "", jid: str = "") -> str:
     """建一条 running 任务。传 jid 时用调用方给的 id（后台全量任务用固定 id 便于查询）。"""
     jid = jid or uuid.uuid4().hex[:12]
-    conn.execute("INSERT INTO jobs(id,kind,status,started_at,total,done,message) VALUES(?,?,?,?,?,?,?)",
-                 (jid, kind, "running", now(), total, 0, message))
+    conn.execute("INSERT INTO jobs(id,kind,status,started_at,total,done,message,pid,updated_at) "
+                 "VALUES(?,?,?,?,?,?,?,?,?)",
+                 (jid, kind, "running", now(), total, 0, message, os.getpid(), now()))
     conn.commit()
     return jid
 
 
 def job_update(conn, jid: str, done: int | None = None, total: int | None = None,
-               message: str | None = None, status: str | None = None) -> None:
+               message: str | None = None, status: str | None = None,
+               pid: int | None = None) -> None:
     sets, params = [], []
-    for col, val in (("done", done), ("total", total), ("message", message), ("status", status)):
+    for col, val in (("done", done), ("total", total), ("message", message),
+                     ("status", status), ("pid", pid)):
         if val is not None:
             sets.append(f"{col}=?")
             params.append(val)
     if not sets:
         return
+    sets.append("updated_at=?")
+    params.append(now())
     params.append(jid)
     conn.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE id=?", params)
     conn.commit()
+
+
+def _pid_alive(pid: int) -> bool:
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+            return bool(ok) and code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+
+
+def job_reap(conn, max_age_seconds: int = 30 * 60, max_silence_seconds: int = 15 * 60) -> list[str]:
+    """把"进程已经没了 / 早就不再心跳"的 running 任务标记为 interrupted。
+
+    否则一个被强杀的后台任务会永远挡住后续索引（写锁保护会一直以为有任务在跑）。
+    判断依据两条，缺一不可：
+      · 进程还活着（pid 由真正干活的子进程自己登记；后台任务会重新登记为自己的 pid）
+      · 并且 15 分钟内有心跳（progress 每 25 篇更新一次）
+    只看 pid 会被 Windows 的 pid 复用骗到；只看时间会误杀慢任务。
+    """
+    killed = []
+    for r in conn.execute("SELECT id, pid, started_at, updated_at FROM jobs WHERE status='running'"):
+        pid = r["pid"] or 0
+        try:
+            silence = time.time() - datetime.datetime.fromisoformat(
+                r["updated_at"] or r["started_at"]).timestamp()
+        except (TypeError, ValueError):
+            silence = max_age_seconds + 1
+        if pid and _pid_alive(pid) and silence < max_silence_seconds:
+            continue
+        if not pid and silence < max_age_seconds:
+            continue
+        conn.execute("UPDATE jobs SET status='interrupted', finished_at=?, "
+                     "message=COALESCE(message,'')||' [进程已不在或超过15分钟没心跳，标记为中断]' "
+                     "WHERE id=?", (now(), r["id"]))
+        killed.append(r["id"])
+    if killed:
+        conn.commit()
+    return killed
 
 
 def job_finish(conn, jid: str, status: str = "done", message: str = "") -> None:

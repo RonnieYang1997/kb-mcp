@@ -130,7 +130,26 @@ def index_source(conn, cfg, src: dict, embedder=None, full: bool = False,
     st = {"source": src["id"], "total": len(files), "new": 0, "updated": 0, "unchanged": 0,
           "removed": 0, "dead": 0, "empty": 0, "errors": 0, "chunks": 0, "embedded": 0,
           "head_before": head_before, "head_after": head_before, "budget_hit": False,
-          "dead_files": [], "error_files": [], "locked": False}
+          "dead_files": [], "error_files": [], "locked": False,
+          "backfilled_chunks": 0, "model_mismatch": False, "embed_model": ""}
+
+    # 向量模型一致性：index 里存的是哪个 ONNX 文件，就必须只用它。
+    # 换了 embed.model_file（比如 int8 -> fp32）而没重建，就只更新全文、不写向量，
+    # 否则两种向量混在一张表里，相似度会静默算错。
+    can_embed = embedder is not None and getattr(embedder, "available", False)
+    model_mismatch = False
+    if can_embed:
+        st["embed_model"] = embedder.model_id
+        prev_model = store.meta_get(conn, "embed_model", "")
+        if prev_model and prev_model != embedder.model_id and not full:
+            model_mismatch = True
+            st["model_mismatch"] = True
+            store.log_index(conn, src["id"], "", "warn", "embed_model_changed",
+                            f"{prev_model} -> {embedder.model_id}；本次只更新全文，"
+                            "向量需重新全量重建（kb index --full）")
+        else:
+            store.meta_set(conn, "embed_model", embedder.model_id)
+            conn.commit()
 
     seen = set()
     for i, f in enumerate(files):
@@ -189,7 +208,7 @@ def index_source(conn, cfg, src: dict, embedder=None, full: bool = False,
             st["chunks"] += len(chunks)
             # 先落盘：绝不能把 SQLite 写锁压在慢速的向量化上（否则并发任务会 database is locked）
             conn.commit()
-            if chunks and embedder is not None and getattr(embedder, "available", False):
+            if chunks and can_embed and not model_mismatch:
                 vec = embedder.encode(chunks, prefix=cfg.get("embed", {}).get("doc_prefix", ""))
                 store.insert_embeddings(conn, cids, vec, embedder.model_id)
                 st["embedded"] += len(cids)
@@ -219,6 +238,15 @@ def index_source(conn, cfg, src: dict, embedder=None, full: bool = False,
 
     st["head_after"] = git_head(src["root"])
     st["head_changed"] = bool(st["head_before"] and st["head_after"] != st["head_before"])
+    # 补向量：万一上次在"片段已落盘、向量还没写"之间被打断（或先用 --fts-only 建了文本），
+    # 这里把缺向量的片段补齐，否则这些片段会永远搜不到（sha1 没变就不会重做）。
+    if can_embed and not model_mismatch:
+        bf = backfill_embeddings(conn, cfg, embedder, budget_seconds=budget_seconds)
+        st["backfilled_chunks"] = bf["chunks"]
+        st["embedded"] += bf["chunks"]
+        if bf["chunks"]:
+            store.log_index(conn, src["id"], "", "backfill", "ok",
+                            f"补齐 {bf['chunks']} 个缺向量的片段（{bf['docs']} 篇）")
     st["took_ms"] = int((time.time() - t_start) * 1000)
     store.meta_set(conn, f"head:{src['id']}", st["head_after"])
     store.meta_set(conn, "last_index_ts", time.time())
@@ -228,6 +256,42 @@ def index_source(conn, cfg, src: dict, embedder=None, full: bool = False,
         store.log_index(conn, src["id"], "", "warn", "head_changed",
                         f"{st['head_before']} -> {st['head_after']}")
     return st
+
+
+# ---------- 向量补齐 ----------
+
+def backfill_embeddings(conn, cfg, embedder, budget_seconds=None, max_docs=400) -> dict:
+    """给"有片段但没有向量"的文档补向量。
+
+    为什么需要：片段落盘和向量写入是两个事务（为了不长时间占写锁），
+    中途被杀 / 断电 / 先用 --fts-only 建文本，都会留下无向量的片段。
+    这些片段全文能搜到、向量搜不到，而且因为文件 sha1 没变，永远不会被重做。
+    """
+    if embedder is None or not getattr(embedder, "available", False):
+        return {"docs": 0, "chunks": 0}
+    doc_ids = [r[0] for r in conn.execute(
+        "SELECT DISTINCT c.doc_id FROM chunks c LEFT JOIN embeddings e ON e.chunk_id=c.id "
+        "WHERE e.chunk_id IS NULL LIMIT ?", (max_docs,))]
+    if not doc_ids:
+        return {"docs": 0, "chunks": 0}
+    prefix = cfg.get("embed", {}).get("doc_prefix", "")
+    t0 = time.time()
+    done_docs = done_chunks = 0
+    for doc_id in doc_ids:
+        if budget_seconds and (time.time() - t0) > budget_seconds:
+            break
+        rows = list(conn.execute(
+            "SELECT c.id AS cid, c.text AS text FROM chunks c "
+            "LEFT JOIN embeddings e ON e.chunk_id=c.id WHERE c.doc_id=? AND e.chunk_id IS NULL "
+            "ORDER BY c.seq", (doc_id,)))
+        if not rows:
+            continue
+        vec = embedder.encode([r["text"] for r in rows], prefix=prefix)
+        store.insert_embeddings(conn, [r["cid"] for r in rows], vec, embedder.model_id)
+        conn.commit()          # 每篇一个短事务，别占着写锁
+        done_docs += 1
+        done_chunks += len(rows)
+    return {"docs": done_docs, "chunks": done_chunks, "remaining_docs": max(0, len(doc_ids) - done_docs)}
 
 
 # ---------- 陈旧检查（惰性兜底） ----------
@@ -290,6 +354,7 @@ def ensure_fresh(conn, cfg, embedder=None, force: bool = False,
            "new": len(diff["new"]), "changed": len(diff["changed"]), "removed": len(diff["removed"]),
            "last_index_ts": float(store.meta_get(conn, "last_index_ts", 0) or 0), "runs": []}
     if force or diff["stale"]:
+        store.job_reap(conn)
         running = [j for j in store.recent_jobs(conn, 3) if j.get("status") == "running"]
         if running:
             # 已有后台任务在写索引库：本次不抢写锁，只报告"待补"

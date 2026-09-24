@@ -104,17 +104,31 @@ def rrf_fuse(rank_lists: list[list[tuple[int, float]]], k: int = 60) -> dict[int
     return fused
 
 
+RE_CONTENT = re.compile(r"[0-9A-Za-z\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]")
+
+
+def _has_content(q) -> bool:
+    """查询里至少得有一个字/字母/数字，纯标点和空白不算。"""
+    return bool(q and RE_CONTENT.search(str(q)))
+
+
 def search(conn, cfg: dict, query: str, embedder=None, top_k: int | None = None,
            source: str | None = None, mode: str = "hybrid",
            date_from: str | None = None, date_to: str | None = None) -> dict:
     scfg = cfg.get("search", {})
+    t0 = time.time()
+    notes: list[str] = []
+    # 空查询 / 纯标点：不能拿一个空串去算向量，那样会返回一堆"看着像结果"的随机片段
+    if not _has_content(query):
+        return {"query": query, "mode": "empty", "mode_requested": mode,
+                "top_k": int(top_k or scfg.get("default_top_k", 8)), "candidates": {"fts": 0, "vector": 0},
+                "took_ms": int((time.time() - t0) * 1000),
+                "notes": ["查询为空或只有标点/空白，未执行检索"], "results": []}
     top_k = int(top_k or scfg.get("default_top_k", 8))
     top_k = max(1, min(top_k, int(scfg.get("max_top_k", 50))))
     fts_lim = int(scfg.get("fts_candidates", 200))
     vec_lim = int(scfg.get("vector_candidates", 200))
     k = int(scfg.get("rrf_k", 60))
-    t0 = time.time()
-    notes: list[str] = []
     where, params = _doc_filter(source, date_from, date_to)
 
     fts_rows: list[tuple[int, float]] = []

@@ -175,6 +175,57 @@ def main() -> int:
           f"total={lk2.get('total')} chunks={lk2.get('chunks')} embedded={lk2.get('embedded')}")
     check(store.counts(conn)["docs"] == docs_before, "锁定期间文档数不变")
 
+    print("\n== 6c. 新增文件 / 崩溃残局 / 换模型 ==")
+    # a) 全新文件（不是修改既有文件）也应建片段+向量
+    src_dir = fx["dir"]
+    brand_new = src_dir / "dufu-BVnewfile9001.md"
+    body_txt = ("大家好，这是一篇全新的转录，用于验证新增文件的增量索引。"
+                "今天讲三件事：通胀、就业、以及消费信心。") * 8
+    brand_new.write_text("---\ntitle: 全新测试\ndescription: 2026-09-24 新增\n---\n\n" + body_txt,
+                         encoding="utf-8")
+    store.meta_set(conn, "last_walk_ts", time.time() - 10_000)
+    conn.commit()
+    inc = indexer.index_source(conn, cfg, cfg["sources"][0], embedder=emb, full=False)
+    row = conn.execute("SELECT id, state, n_chunks FROM docs WHERE rel_path LIKE '%newfile9001%'").fetchone()
+    check(row is not None and row["state"] == "indexed" and row["n_chunks"] > 0,
+          "新增文件被索引成片段", f"new={inc['new']} chunks={row['n_chunks'] if row else '-'}")
+    if emb.available and row:
+        nv = conn.execute("SELECT COUNT(*) FROM embeddings e JOIN chunks c ON c.id=e.chunk_id "
+                          "WHERE c.doc_id=?", (row["id"],)).fetchone()[0]
+        check(nv == row["n_chunks"], "新增文件的片段全部带上向量（今晚 daily_scan 依赖这条）",
+              f"vectors={nv}/{row['n_chunks']}")
+
+    # b) 模拟"片段落盘了、向量还没写就崩" → 下次 index 应自动补齐
+    if emb.available and row:
+        victim = [r[0] for r in conn.execute(
+            "SELECT chunk_id FROM embeddings ORDER BY chunk_id DESC LIMIT 3")]
+        conn.executemany("DELETE FROM embeddings WHERE chunk_id=?", [(i,) for i in victim])
+        conn.commit()
+        lost = conn.execute("SELECT COUNT(*) FROM chunks c LEFT JOIN embeddings e ON e.chunk_id=c.id "
+                            "WHERE e.chunk_id IS NULL").fetchone()[0]
+        bf = indexer.index_source(conn, cfg, cfg["sources"][0], embedder=emb, full=False)
+        still = conn.execute("SELECT COUNT(*) FROM chunks c LEFT JOIN embeddings e ON e.chunk_id=c.id "
+                             "WHERE e.chunk_id IS NULL").fetchone()[0]
+        check(lost > 0 and bf["backfilled_chunks"] > 0 and still == 0,
+              "缺向量的片段被自动补齐（防「崩在两次提交之间」）",
+              f"缺={lost} 补={bf['backfilled_chunks']} 剩余={still}")
+
+    # c) 换向量模型（int8 <-> fp32）时不得把两种向量混在一张表里
+    if emb.available:
+        good_id = emb.model_id
+        store.meta_set(conn, "embed_model", "bogus-model::x::512")
+        conn.commit()
+        n_before = store.counts(conn)["embeddings"]
+        mm = indexer.index_source(conn, cfg, cfg["sources"][0], embedder=emb, full=False)
+        n_after = store.counts(conn)["embeddings"]
+        check(mm["model_mismatch"] is True and mm["embedded"] == 0 and n_after == n_before,
+              "换了向量模型时拒绝混写（只更新全文，要求 --full 重建）",
+              f"mismatch={mm['model_mismatch']} {n_before}->{n_after}")
+        store.meta_set(conn, "embed_model", good_id)
+        conn.commit()
+        back = indexer.index_source(conn, cfg, cfg["sources"][0], embedder=emb, full=False)
+        check(back["model_mismatch"] is False, "模型标识恢复正常后不再告警")
+
     print("\n== 7. 源库未被改动（三重证据） ==")
     left = [(p, sha1(p) != src_sha_before[p]) for p in fx["source_files"]]
     check(not any(ch for _, ch in left), "被复制的源文件 sha1 未变",

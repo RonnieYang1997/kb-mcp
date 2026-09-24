@@ -61,7 +61,10 @@ def cmd_index(args) -> int:
         store.job_start(conn, "full" if args.full else "incremental", total=n_files, jid=job_id,
                         message=f"{'全量' if args.full else '增量'}索引开始，共 {n_files} 篇"
                                 + ("，含向量化" if emb is not None else "，仅全文"))
-        store.job_update(conn, job_id, status="running")
+    if job_id:
+        # 关键：把 pid 登记成"真正干活的那个进程"。后台任务的 pid 不能是派发它的服务进程，
+        # 否则进程存活判断会失真（Windows pid 还会被复用）。
+        store.job_update(conn, job_id, status="running", pid=os.getpid())
     if not args.quiet:
         print(f"[kb index] full={args.full} source={args.source or '*'}")
         print(f"[kb index] db={cfg['db_path']}")

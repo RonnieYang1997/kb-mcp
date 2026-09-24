@@ -29,6 +29,7 @@ class Embedder:
         self._tok = None
         self._sess = None
         self._inputs: list[str] = []
+        self._onnx_file = ""
 
     # ---------- 加载 ----------
 
@@ -70,6 +71,10 @@ class Embedder:
             self._tok = tok
             self._sess = sess
             self._inputs = [i.name for i in sess.get_inputs()]
+            try:
+                self._onnx_file = str(onnx_path.relative_to(self.model_dir)).replace("\\", "/")
+            except ValueError:
+                self._onnx_file = onnx_path.name
             self.available = True
             self.reason = "ok"
         except Exception as e:
@@ -78,7 +83,10 @@ class Embedder:
 
     @property
     def model_id(self) -> str:
-        return MODEL_NAME
+        """必须能区分量化版本：换 model_file 就等于换了一套向量，混用会静默算错相似度。"""
+        if self._onnx_file:
+            return f"{MODEL_NAME}::{self._onnx_file}::{self.dim}"
+        return f"{MODEL_NAME}::{self.model_file or '?'}::{self.dim}"
 
     # ---------- 编码 ----------
 

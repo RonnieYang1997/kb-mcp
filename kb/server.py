@@ -144,6 +144,59 @@ def tool_defs() -> list[dict]:
     ]
 
 
+# ---------- 工具参数：宽容但绝不含糊 ----------
+
+def _as_bool(v, default: bool = False) -> bool:
+    """严格布尔：'false'/'0'/'no' 都是 False。
+
+    不能直接 bool(v)——字符串 "false" 是 truthy，一次手滑就会误触发 2 小时的全量重建。
+    """
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("false", "0", "no", "off", "n", ""):
+            return False
+        if s in ("true", "1", "yes", "on", "y"):
+            return True
+    return default
+
+
+def _as_int(v, default: int, lo: int | None = None, hi: int | None = None) -> int:
+    """容错取整：'abc' / null / 越界都不会把 Python 异常泄漏给调用方。"""
+    if v is None or isinstance(v, bool):
+        n = default
+    elif isinstance(v, (int, float)):
+        n = int(v)
+    else:
+        try:
+            n = int(str(v).strip())
+        except (TypeError, ValueError):
+            n = default
+    if lo is not None:
+        n = max(lo, n)
+    if hi is not None:
+        n = min(hi, n)
+    return n
+
+
+VALID_MODES = ("hybrid", "fts", "vector")
+
+
+def _as_mode(v, notes: list) -> str:
+    if not v:
+        return "hybrid"
+    s = str(v).strip().lower()
+    if s in VALID_MODES:
+        return s
+    notes.append(f"未知 mode={v!r}，已按 hybrid 处理（可选：{'/'.join(VALID_MODES)}）")
+    return "hybrid"
+
+
 # ---------- 工具实现 ----------
 
 class Ctx:
@@ -197,10 +250,16 @@ def _doc_text(cfg, src_id: str, abs_path: str) -> str:
 
 def t_search(ctx: Ctx, args: dict) -> dict:
     ctx.ensure_fresh()
+    s_cfg = ctx.cfg.get("search", {})
+    notes: list = []
+    top_k = _as_int(args.get("top_k"), int(s_cfg.get("default_top_k", 8)), 1,
+                    int(s_cfg.get("max_top_k", 50)))
     res = search_mod.search(ctx.conn, ctx.cfg, str(args.get("query", "")), embedder=ctx.embedder,
-                            top_k=args.get("top_k"), source=args.get("source"),
-                            mode=args.get("mode", "hybrid"),
+                            top_k=top_k, source=args.get("source"),
+                            mode=_as_mode(args.get("mode"), notes),
                             date_from=args.get("date_from"), date_to=args.get("date_to"))
+    if notes:
+        res.setdefault("notes", []).extend(notes)
     res["index"] = _fresh_brief(ctx)
     if not res["results"]:
         res["hint"] = "没有命中。可尝试缩短查询词、用 mode=fts，或先调 reindex 确认索引已建。"
@@ -241,8 +300,8 @@ def t_fetch(ctx: Ctx, args: dict) -> dict:
         doc = _resolve_doc(ctx.conn, args.get("doc_id"), args.get("path"), args.get("bvid"))
     if not doc:
         return {"error": "未找到对应文档；请先用 search 或 list_documents 取 chunk_id/doc_id/path/bvid"}
-    max_chars = int(args.get("max_chars") or 20000)
-    offset = max(0, int(args.get("offset") or 0))
+    max_chars = _as_int(args.get("max_chars"), 20000, 1, 2_000_000)
+    offset = _as_int(args.get("offset"), 0, 0)
     if not os.path.exists(doc["abs_path"]):
         return {"error": f"源文件已不存在: {doc['rel_path']}（可能已被移动，索引需要刷新）"}
     body, m = _doc_text(ctx.cfg, doc["source_id"], doc["abs_path"])
@@ -283,8 +342,8 @@ def t_list_documents(ctx: Ctx, args: dict) -> dict:
         where.append("state='indexed'")
     order = {"date_desc": "date DESC, bvid DESC", "date_asc": "date ASC, bvid ASC",
              "title": "title ASC"}.get(args.get("order", "date_desc"), "date DESC")
-    limit = max(1, min(int(args.get("limit") or 50), 200))
-    offset = max(0, int(args.get("offset") or 0))
+    limit = _as_int(args.get("limit"), 50, 1, 200)
+    offset = _as_int(args.get("offset"), 0, 0)
     cond = " AND ".join(where)
     total = ctx.conn.execute(f"SELECT COUNT(*) FROM docs WHERE {cond}", params).fetchone()[0]
     rows = []
@@ -338,9 +397,9 @@ def t_stats(ctx: Ctx, args: dict) -> dict:
 
 
 def t_reindex(ctx: Ctx, args: dict) -> dict:
-    full = bool(args.get("full"))
+    full = _as_bool(args.get("full"))          # 严格布尔："false" 必须真的是 False
     source = args.get("source")
-    wait = int(args.get("wait_seconds") or 60)
+    wait = _as_int(args.get("wait_seconds"), 60, 0, 1800)
     cfg = ctx.cfg
     if indexer.indexing_locked(cfg):
         return {"ok": False, "locked": True, "mode": "full" if full else "incremental",
@@ -348,6 +407,11 @@ def t_reindex(ctx: Ctx, args: dict) -> dict:
                 "hint": "第二步安全开关生效中；用户确认资料修复完毕后把 config.json 的 scan.auto_index 改为 true。"}
     # 已有后台任务在跑时不要并发写同一个索引库（SQLite 单写者）
     if not args.get("force"):
+        store.job_reap(ctx.conn)          # 先清掉"进程已死但状态还挂着"的僵尸任务
+        known = {s["id"] for s in ctx.cfg.get("sources", [])}
+        if source and source not in known:
+            return {"ok": False, "error": f"未知 source={source!r}", "known_sources": sorted(known),
+                    "hint": "用 stats 或 list_documents 看可用资料库 id；新库要用 kb add-source 添加。"}
         running = [j for j in store.recent_jobs(ctx.conn, 5) if j.get("status") == "running"]
         if running:
             j = running[0]
@@ -358,7 +422,7 @@ def t_reindex(ctx: Ctx, args: dict) -> dict:
                     "message": f"已有任务 {j['id']} 正在运行（{j['done']}/{j['total']}），"
                                "为避免索引库写冲突，本次未执行。",
                     "hint": "等它跑完，或传 force=true 强行排队（会等锁，可能很慢）。"}
-    if full and bool(args.get("background", True)):
+    if full and _as_bool(args.get("background"), True):
         jid = store.job_start(ctx.conn, "full-reindex", 0, "排队中（后台进程）")
         script = ROOT / "bin" / "kb_index.py"
         cmd = [sys.executable, str(script), "--full", "--job-id", jid]
