@@ -44,6 +44,7 @@
     "rrf_k": 60,
     "default_top_k": 8,
     "max_top_k": 50,
+    "max_per_doc": 2,
     "fts_candidates": 200,
     "vector_candidates": 200,
     "snippet_chars": 240,

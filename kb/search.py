@@ -114,7 +114,8 @@ def _has_content(q) -> bool:
 
 def search(conn, cfg: dict, query: str, embedder=None, top_k: int | None = None,
            source: str | None = None, mode: str = "hybrid",
-           date_from: str | None = None, date_to: str | None = None) -> dict:
+           date_from: str | None = None, date_to: str | None = None,
+           sort: str | None = None) -> dict:
     scfg = cfg.get("search", {})
     t0 = time.time()
     notes: list[str] = []
@@ -155,8 +156,37 @@ def search(conn, cfg: dict, query: str, embedder=None, top_k: int | None = None,
     fts_rank = {cid: i for i, (cid, _) in enumerate(fts_rows, 1)}
     vec_rank = {cid: i for i, (cid, _) in enumerate(vec_rows, 1)}
     vec_sim = {cid: s for cid, s in vec_rows}
-    ordered = sorted(fused.items(), key=lambda kv: (-kv[1], kv[0]))[:top_k]
-    meta = store.doc_of_chunk(conn, [cid for cid, _ in ordered])
+    ordered_all = sorted(fused.items(), key=lambda kv: (-kv[1], kv[0]))
+    meta_all = store.doc_of_chunk(conn, [cid for cid, _ in ordered_all[:max(top_k * 8, 200)]])
+
+    sort_mode = str(sort or "relevance").lower()
+    if sort_mode == "recent":
+        # 按出处日期优先（同日内再比融合分）：适合"最近怎么说这件事"
+        ordered_all.sort(key=lambda kv: ((meta_all.get(kv[0], {}) or {}).get("date") or "", kv[1]),
+                         reverse=True)
+        notes.append("已按出片时间优先排序（sort=recent）")
+    elif sort_mode != "relevance":
+        notes.append(f"未知 sort={sort!r}，已按 relevance 处理（可选：relevance/recent）")
+
+    # 同一篇转录最多出 max_per_doc 个片段：否则一个热门话题会被同一支视频的相邻片段刷屏，
+    # 把新内容和其他角度全挤下去（实测出现过一篇占前 50 名里 9 个位置）。
+    max_per_doc = int(scfg.get("max_per_doc", 2))
+    ordered, per_doc, suppressed = [], {}, 0
+    for cid, score in ordered_all:
+        if cid not in meta_all:
+            continue
+        did = meta_all[cid]["doc_id"]
+        if max_per_doc > 0 and per_doc.get(did, 0) >= max_per_doc:
+            suppressed += 1
+            continue
+        per_doc[did] = per_doc.get(did, 0) + 1
+        ordered.append((cid, score))
+        if len(ordered) >= top_k:
+            break
+    if suppressed:
+        notes.append(f"同一篇对话最多保留 {max_per_doc} 个片段，已折叠 {suppressed} 个同源结果"
+                     f"（可用 search.max_per_doc 调整）")
+    meta = meta_all
 
     snip_len = int(scfg.get("snippet_chars", 240))
     results = []

@@ -82,6 +82,7 @@ def main() -> int:
     (tmp / "config.json").write_text(json.dumps(example, ensure_ascii=False, indent=2), encoding="utf-8")
 
     from kb import config as cfgmod, embed as embed_mod, indexer, store, textproc
+    from kb import search as search_mod
     from kb.search import search as do_search
 
     cfg = cfgmod.load()
@@ -139,6 +140,14 @@ def main() -> int:
         check(len(r_vec["results"]) > 0, f"向量检索命中 {len(r_vec['results'])} 条")
         check(any(x["vector_rank"] for x in r_hy["results"]), "混合结果里含向量命中来源")
     check(any(x["fts_rank"] for x in r_hy["results"]), "混合结果里含全文命中来源")
+    from collections import Counter as _Counter
+    _cnt = _Counter(x["bvid"] for x in r_hy["results"])
+    check(max(_cnt.values() or [0]) <= 2, "同一篇最多 2 个片段（同源折叠生效）", f"{dict(_cnt)}")
+    _recent = search_mod.search(conn, cfg, "疫苗", embedder=emb, top_k=5, sort="recent")
+    _dates = [x["date"] for x in _recent["results"] if x.get("date")]
+    check(_dates == sorted(_dates, reverse=True), "sort=recent 按出片时间倒序", f"{_dates[:5]}")
+    _empty = search_mod.search(conn, cfg, "  。。 ", embedder=emb, top_k=5)
+    check(_empty["mode"] == "empty" and not _empty["results"], "空/纯标点查询返回空而不是随机结果")
 
     print("\n== 5. fetch 全文 ==")
     doc = conn.execute("SELECT id, rel_path, state FROM docs WHERE state='indexed' LIMIT 1").fetchone()

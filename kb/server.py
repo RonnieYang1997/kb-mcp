@@ -69,7 +69,8 @@ def tool_defs() -> list[dict]:
             "description": ("在本地转录语料里做混合检索（中文全文 + 向量，RRF 融合）。"
                             "返回带出处的片段：标题/日期/BVID/文件路径/片段序号，"
                             "每条结果都带 chunk_id 与 doc_id。"
-                            "要看完整上下文就把 chunk_id 交给 fetch（会自动对准命中位置）。"),
+                            "同一篇对话最多出现 2 个片段（避免一篇刷屏），要看完整上下文就把 "
+                            "chunk_id 交给 fetch（会自动对准命中位置）。"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -78,6 +79,9 @@ def tool_defs() -> list[dict]:
                     "source": {"type": "string", "description": "只在某个资料库内检索（库 id）"},
                     "mode": {"type": "string", "enum": ["hybrid", "fts", "vector"],
                              "description": "hybrid=全文+向量（默认）；fts=只全文；vector=只向量"},
+                    "sort": {"type": "string", "enum": ["relevance", "recent"],
+                             "description": "relevance=按相关度（默认）；recent=先按出片时间倒序，"
+                                            "适合「最近怎么说这件事」"},
                     "date_from": {"type": "string", "description": "起始日期 YYYY-MM-DD"},
                     "date_to": {"type": "string", "description": "结束日期 YYYY-MM-DD"},
                 },
@@ -257,7 +261,8 @@ def t_search(ctx: Ctx, args: dict) -> dict:
     res = search_mod.search(ctx.conn, ctx.cfg, str(args.get("query", "")), embedder=ctx.embedder,
                             top_k=top_k, source=args.get("source"),
                             mode=_as_mode(args.get("mode"), notes),
-                            date_from=args.get("date_from"), date_to=args.get("date_to"))
+                            date_from=args.get("date_from"), date_to=args.get("date_to"),
+                            sort=args.get("sort"))
     if notes:
         res.setdefault("notes", []).extend(notes)
     res["index"] = _fresh_brief(ctx)
