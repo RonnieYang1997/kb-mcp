@@ -46,7 +46,7 @@ $repo = "C:\Users\Ronnie\Documents\GitHub\kb-mcp"
 & $kb -m kb verify-article 某篇文稿.md --strict     # 整篇核对（别名 va）
 & $kb -m kb stats                  # 数量、是否过期、最近任务
 & $kb -m kb add-source --root "D:\某个库" --id mylib --label "我的库"
-& $kb tools\selftest.py            # 端到端自测（59 项）
+& $kb tools\selftest.py            # 端到端自测（62 项）
 & $kb tools\health_check.py        # 只读体检（11 项）
 & $kb tools\e2e_check.py           # 调 MCP 验证「真能取到已向量化的内容」（13 项）
 ```
@@ -96,15 +96,17 @@ kb verify-article 文稿.md --strict                            # 有引文没�
 | `whitespace` | 仅空白/全半角差异，文字一字不差 | ✅ |
 | `loose` | 仅标点差异（转录标点本身就不统一） | ✅ 文字一字不差 |
 | `annotated` | 文字一致，但引文里插了原文没有的括注 `（…）` | ⚠️ 逐条列出，建议改 `［］` 或删掉 |
-| `modified` | 多字/少字/改字（例：原文「60年代以后西方就没有…」被写成「西方60年代以后就没有…」） | ❌ 附 `matched_text` 与多出/缺少的片段 |
+| `modified` | 引文与原文有**实质**差异：多字/少字/改字。也包括「你标注这篇里有一句几乎一模一样的，但你没照它抄」（例：原文「60年代以后西方就没有…」写成「西方60年代以后就没有…」） | ❌ 附 `matched_text` 和 `extra_in_quote` / `missing_from_quote`，照抄即可 |
 | `other_doc` | 这句是真的，但不在你标注的那一篇里 | ❌ 出处标错了 |
 | `not_in_body` | 只在乱码表头/元数据区，正文里没有 | ❌ 不能引 |
-| `not_found` | 全库查不到 | ❌ 附最接近的原文片段供改写 |
+| `not_found` | 全库查不到（相似度低于 0.3 的"建议"会被当噪声丢掉，不糊弄你） | ❌ 附最接近的原文片段供改写；没给 `bvid` 时提示补上会更准 |
 | `error` | 空引文、BVID/doc_id 不存在 | ❌ |
 
 几个已处理的细节：引文里的省略号（`……`/`...`/`<>`）会**自动拆段分别核对**；
 Markdown 加粗标记会被剥掉；繁体转录必须照原文保留繁体（如 `如果說中國救災不利 請舉例`）；
 结果里的 `in_chunk` 标志专门暴露「跨片段」这种索引侧假阴性。
+「改字」是**判不通过**而不是含糊的"查不到"：库里确有一句相似度 ≥0.6 的原文时判 `modified`，
+直接把该照抄的 `matched_text` 摆出来（实测改一个字相似度 ≥0.68，凭空编的句子最高只到 0.19）。
 
 **实测效果**：本仓库第一篇产出文稿（16 条引文）首轮核对 **13 条里 8 条没通过**——
 全是「顺手抚平」造成的：调语序、丢字、插括注、把转录的错别字改成了正确写法。
@@ -188,7 +190,6 @@ kb/         实现：config / textproc / store / embed / search / indexer / serv
 scripts/    fetch_model.py：从 hf-mirror 或 ModelScope 拉取 ONNX 模型并校验
 kb/         config.py 配置 · store.py SQLite/FTS5 · textproc.py 清洗切块 · embed.py ONNX · indexer.py 增量索引（含安全锁）· search.py 混合检索 · verify.py 引文核对 · server.py MCP · cli.py 命令行 · audit.py 只读自审 · console.py 输出编码
 tools/      selftest.py 端到端自测 · health_check.py 索引体检 · e2e_check.py 调 MCP 取回存量向量的端到端验证 · bench_embed.py 性能基准 · compare_models.py 模型对比 · estimate.py 规模估算
-            estimate.py 规模预估 · compare_models.py 模型取舍对比
 config.example.json  默认配置（含源库定义，提交进 git）
 config.json          本机配置（绝对路径，不进 git）
 ```
@@ -197,7 +198,7 @@ config.json          本机配置（绝对路径，不进 git）
 
 ## 七、已验证
 
-`python tools/selftest.py` → **59/59 PASS**，含：
+`python tools/selftest.py` → **62/62 PASS**，含：
 
 - 清洗：BOM、GBK 乱码表头、乱码小标题在索引里彻底消失，正文完整保留；
 - 失效正文识别：JSON `upstream_error` / HTML 5xx → 标记 `dead` 且不产生片段；
@@ -207,8 +208,10 @@ config.json          本机配置（绝对路径，不进 git）
 - `fetch` 取全文；陈旧检查能发现改动并自动补索引、节流生效；
 - **第二步安全开关**：`auto_index=false` 时 `ensure_fresh` 与 `index_source` 均直接返回锁定，
   不遍历源库、不建索引、不算向量、文档数不变；
-- **引文核对**：原文原句 → `verbatim`；改一个字 → 判不通过并给出原文；
+- **引文核对**：原文原句 → `verbatim`；改一个字 → 判不通过，并**直接给出该照抄的原文
+  与多出来/少了的那几个字**（`matched_text` + `extra_in_quote` / `missing_from_quote`）；
   作者插的括注 → `annotated` 且逐条列出；空引文/假 BVID/假 doc_id → `error` 不崩；
+  凭空编的句子 → `not_found` 且**不给低相似度的噪声建议**，并提示"补上 bvid 会更准"；
   省略号引文自动拆段；**跨片段长句能被核对到（`in_chunk=false`）**——证明核对必须回原文；
 - **源库三重证据未变**：源文件 sha1、mtime、`.git/HEAD` 全部未变；
 - **MCP 协议**：initialize 握手、tools/list 返回 6 个工具、六个工具调用全部成功、
@@ -251,6 +254,7 @@ config.json          本机配置（绝对路径，不进 git）
 | 一篇长对话的相邻片段挤满结果 | 默认同一篇**最多保留 2 个片段**（`search.max_per_doc`），腾出位置给别篇；被折叠的条数会写在 `notes` 里 |
 | 想问"最近讲了什么" | `search(sort="recent")` 按出片时间倒序，新内容不会被历史高分篇目盖住 |
 | `top_k: "abc"`、未知 `mode`、未知 `source` | 参数容错（钳位/回退 hybrid/明确报错），不把 Python 异常泄漏给调用方 |
+| 引文与原文只差一个字 | 判 `modified` 并给出该照抄的原文，**不**含糊地说「库里查不到」；相似度 <0.3 的候选当噪声丢掉，不拿随机片段糊弄 |
 | 向量模型没加载出来 | `mode` 降为 `fts`，`notes` 只说「向量检索不可用（原因）」；**不会**再说「索引尚未补齐」——那是另一码事，说错了会把「模型没加载」误导成「库没建好」 |
 
 `python tools/health_check.py` 是只读体检（11 项）：片段与全文行数一致、无孤儿全文行、

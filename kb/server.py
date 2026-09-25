@@ -120,15 +120,19 @@ def tool_defs() -> list[dict]:
                             "本工具用 FTS 定位候选，但**判定一律回到源文件正文**。"
                             "返回每条引文的状态：verbatim（逐字一致，可引用）/ whitespace（仅空白差异）/"
                             "annotated（文字一致但你插了原文没有的括注）/ loose（仅标点差异）/"
-                            "modified（多字/少字/改字，给了 matched_text 和差异列表）/"
+                            "modified（多字/少字/改字——也含「库里有一句几乎一样的，但你没照它抄」，"
+                            "会给 matched_text 和 extra_in_quote / missing_from_quote，照抄即可）/ "
+                            "other_doc（这句是真的但不在你标注的那篇里，出处标错了）/ "
                             "not_in_body（只在乱码表头或元数据区，不能引）/ not_found（查不到，"
-                            "会给最接近的原文建议）。引文含省略号时会自动拆段分别核对。"),
+                            "会给最接近的原文建议；没给 bvid 时提示补上会更准）/ error（空引文或出处不存在）。"
+                            "引文含省略号时会自动拆段分别核对。"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "quotes": {
                         "description": "要核对的引文：可以是字符串数组，"
-                                       "也可以是对象数组（每项 {\"quote\": \"...\", \"bvid\": \"BV...\"}）",
+                                       "也可以是对象数组（每项 {\"quote\": \"...\", \"bvid\": \"BV...\"}）"
+                                       "——带上 bvid 时判定更准（能区分「改字」和「查不到」）",
                         "type": "array",
                         "items": {"anyOf": [{"type": "string"}, {"type": "object"}]},
                     },

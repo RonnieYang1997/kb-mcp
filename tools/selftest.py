@@ -254,6 +254,10 @@ def main() -> int:
         r_mut = verify_mod.verify_quote(conn, cfg, mut, doc_id=doc["id"])
         check(not r_mut["ok"], "改一个字 → 判不通过（绝不放过改字）",
               f"{r_mut['status']} 建议={len(r_mut['suggestions'])}")
+        check(r_mut["status"] == "modified" and r_mut["matched_text"] != mut
+              and bool(r_mut["extra_in_quote"]),
+              "改一个字 → 判 modified，并直接给出该照抄的原文和多出来的字",
+              f"extra={r_mut['extra_in_quote']} missing={r_mut['missing_from_quote']}")
         ins = probe[:11] + "（补充）" + probe[11:]
         r_ins = verify_mod.verify_quote(conn, cfg, ins, doc_id=doc["id"])
         check(r_ins["status"] == "annotated" and r_ins["ok"]
@@ -276,6 +280,16 @@ def main() -> int:
           "不存在的 bvid → error 并提示（不静默编造）")
     r_inv = verify_mod.verify_quote(conn, cfg, "这段话说的是完全没有的东西啊", doc_id=999999)
     check(r_inv["status"] == "error", "不存在的 doc_id → error")
+
+    # 凭空编的引文：必须明说找不到，而且不能拿低相似度的噪声当"建议"糊弄
+    r_fab = verify_mod.verify_quote(conn, cfg, "这句话是凭空编出来的用于测试核对功能")
+    noisy = [s for s in r_fab.get("suggestions") or []
+             if (s.get("ratio") or 0.0) < verify_mod.SUGGEST_MIN_RATIO]
+    check(r_fab["status"] == "not_found" and not noisy,
+          "凭空编的句子 → not_found，且不给低相似度的噪声建议",
+          f"{r_fab['status']} 建议={len(r_fab.get('suggestions') or [])} 噪声={len(noisy)}")
+    check(any("bvid" in n for n in (r_fab.get("notes") or [])),
+          "not_found 又没给出处时，提示补 bvid 会更准")
 
     # 跨片段边界：只查索引会假阴性，所以核对必须回原文
     long_doc = src_dir / "dufu-BVlong0001.md"

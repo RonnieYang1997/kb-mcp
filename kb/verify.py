@@ -25,7 +25,10 @@
 ``verbatim``     逐字一致 —— 只有这一档才算"可以直接引用"
 ``whitespace``   只差空白/全半角（转录把换行压掉很常见），文字一字不差
 ``loose``        只差标点（转录本身标点就不统一），文字一字不差
-``modified``     引文与原文有**实质**差异：多字、少字、改字（例如引文里插了括号解释）
+``annotated``    文字一字不差，但引文里插了原文没有的括注
+``modified``     引文与原文有**实质**差异：多字、少字、改字（含"你标注这篇里有一句几乎
+                 一模一样的，但你不是照它抄的"——这时 matched_text 就是该照抄的原文）
+``other_doc``    引文是真的，但不在你标注的那一篇里 —— 出处标错了
 ``not_in_body``  正文里没有，但原始文件里有 —— 通常在乱码表头/元数据区，不该引
 ``not_found``    库里根本没有这句话（含模糊建议，告诉你原文大概是怎么写的）
 ``error``        引文为空/太短、BVID 或 doc_id 不存在等
@@ -45,6 +48,12 @@ MIN_QUOTE_CHARS = 4
 MAX_CANDIDATE_DOCS = 12
 MAX_SUGGESTIONS = 3
 MAX_DIFF_ITEMS = 6
+# 给了出处、而出处里恰好有一句「几乎一模一样」的 → 判 modified（引文有实质差异），
+# 而不是 not_found（其实那段就在你标注这篇里，只是你写的和原文不一样）。
+# 0.6 是实测出来的分界：改一两个字的引文相似度 ≥0.68，自撰的句子最高只到 0.19。
+MODIFIED_RATIO = 0.6
+# 相似度低于这个数的「建议」只是噪声（碰巧共用几个词），不如明说「没找到相近的句子」
+SUGGEST_MIN_RATIO = 0.3
 # 省略号的各种写法（含「……」「...」「<...>」「【…】」）
 ELLIPSIS_RE = re.compile(r"(?:…+|\.{3,}|【\s*…+\s*】|\[\s*…+\s*\]|<\s*…+\s*>)")
 # 引文两端可能出现、但不属于原文的引号/括号/装饰符
@@ -321,7 +330,22 @@ def _best_suggestion(cache: _Cache, cfg: dict, needle: str, doc: dict) -> dict |
     o_start = hay.tight_map[start]
     o_end = hay.tight_map[start + span - 1] + 1
     return {"ratio": round(float(ratio), 3), "text": hay.text[o_start:o_end],
+            "offset": o_start, "rel_path": doc.get("rel_path"),
             "bvid": doc.get("bvid"), "doc_id": doc["id"], "title": doc.get("title") or ""}
+
+
+def _focus_on_quote(quote: str, actual: str) -> str:
+    """在建议片段里截出"对应引文的那一段"：从第一个有意义的匹配块到最后一个。
+
+    建议片段是"引文长度 + 24 字"的窗口，直接拿来 diff 会把窗口尾巴全算成"引文缺字"，
+    截一下才只报真正的多字/少字/改字。
+    """
+    q = _clean_quote(quote)
+    sm = difflib.SequenceMatcher(None, q, actual, autojunk=False)
+    blocks = [b for b in sm.get_matching_blocks() if b.size >= 3]
+    if not blocks:
+        return actual
+    return actual[blocks[0].b:blocks[-1].b + blocks[-1].size]
 
 
 # ---------------------------------------------------------------- 单条核对
@@ -372,6 +396,7 @@ def verify_quote(conn, cfg: dict, quote: str, bvid: str | None = None,
     can_strip = bool(brackets) and len(_tight(un_bracketed)) >= MIN_QUOTE_CHARS
 
     docs: list[dict] = []
+    declared = bool(bvid) or doc_id is not None   # 用户有没有明确指出处
     if doc_id is not None:
         d = _doc_row_by_id(conn, doc_id)
         if d:
@@ -494,12 +519,41 @@ def verify_quote(conn, cfg: dict, quote: str, bvid: str | None = None,
             s = _best_suggestion(cache, cfg, needle, d)
             if s:
                 sug.append(s)
+        # 相似度太低的"建议"是噪声（只是碰巧共用几个词），宁可明说没找到
+        sug = [s for s in sug if (s.get("ratio") or 0.0) >= SUGGEST_MIN_RATIO]
         sug.sort(key=lambda x: -(x.get("ratio") or 0.0))
-        if not sug:
+        if not sug and declared:
             # diff 找不到相近句（引文被改得太远）→ 至少给"你标注那篇里沾边的片段"
-            for d in (docs or cands)[:2]:
+            for d in docs[:2]:
                 sug.extend(_chunk_hint(conn, q, d))
         res["suggestions"] = sug[:max_suggestions]
+
+        # 库里有一句"几乎一模一样"的 → 这不是"库里查不到"，而是"这段文字就在库里，
+        # 但你写的和原文不一样"。照 matched_text 改写即可。
+        top = sug[0] if sug else None
+        if top and not top.get("from_chunk"):
+            focused = _focus_on_quote(un_bracketed if can_strip else q, top["text"])
+            extra, missing = _diff_detail(un_bracketed if can_strip else q, focused)
+            off = top.get("offset")
+            res.update(status="modified", verdict=_VERDICT["modified"],
+                       bvid=top.get("bvid"), doc_id=top["doc_id"],
+                       title=top.get("title") or "", rel_path=top.get("rel_path"),
+                       offset=off, matched_text=focused, extra_in_quote=extra,
+                       missing_from_quote=missing,
+                       in_chunk=_in_chunk(conn, cache, top["doc_id"],
+                                          un_bracketed if can_strip else q))
+            if off is not None:
+                body = cache.body[int(top["doc_id"])]
+                res["context"] = body[max(0, off - int(context_chars)):
+                                      off + len(focused) + int(context_chars)]
+            where = ("你标注的那一篇" if declared
+                     else f"{top.get('bvid') or ''}《{top.get('title') or ''}》".strip())
+            res["notes"].append(
+                f"库里 {where} 有一句几乎一模一样的（相似度 {top['ratio']}），"
+                "但你写的和它不一样——请照 matched_text 改写，"
+                "多出/缺少的字已列在 extra_in_quote / missing_from_quote")
+            return res
+
         if sug and sug[0].get("from_chunk"):
             res["notes"].append(
                 "没找到相近的句子；建议里给的是你标注那篇中与引文关键词最接近的片段，"
@@ -509,6 +563,10 @@ def verify_quote(conn, cfg: dict, quote: str, bvid: str | None = None,
                 f"最接近的原文在第 1 条建议里（相似度 {sug[0]['ratio']}），请照它改写引文")
         else:
             res["notes"].append("连相近的句子都没找到——这句很可能是自撰的")
+        if not declared:
+            res["notes"].append(
+                "若你知道这句出自哪一篇，把 bvid（或 doc_id）一起给我，"
+                "我能更准地指出最接近的原文是在哪一篇的哪一段")
     return res
 
 
