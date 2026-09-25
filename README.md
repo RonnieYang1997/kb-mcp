@@ -46,6 +46,9 @@ $repo = "C:\Users\Ronnie\Documents\GitHub\kb-mcp"
 & $kb -m kb verify-article 某篇文稿.md --strict     # 整篇核对（别名 va）
 & $kb -m kb stats                  # 数量、是否过期、最近任务
 & $kb -m kb add-source --root "D:\某个库" --id mylib --label "我的库"
+& $kb tools\selftest.py            # 端到端自测（59 项）
+& $kb tools\health_check.py        # 只读体检（11 项）
+& $kb tools\e2e_check.py           # 调 MCP 验证「真能取到已向量化的内容」（13 项）
 ```
 
 MCP 服务由 AionUi 以 stdio 方式拉起，入口是 `bin\kb_serve.py`，
@@ -184,7 +187,7 @@ bin/        入口脚本（kb_serve.py 供 AionUi 拉起；kb_index.py 供 daily
 kb/         实现：config / textproc / store / embed / search / indexer / server / cli / audit
 scripts/    fetch_model.py：从 hf-mirror 或 ModelScope 拉取 ONNX 模型并校验
 kb/         config.py 配置 · store.py SQLite/FTS5 · textproc.py 清洗切块 · embed.py ONNX · indexer.py 增量索引（含安全锁）· search.py 混合检索 · verify.py 引文核对 · server.py MCP · cli.py 命令行 · audit.py 只读自审 · console.py 输出编码
-tools/      selftest.py 端到端自测 · health_check.py 索引体检 · bench_embed.py 性能基准 · compare_models.py 模型对比 · estimate.py 规模估算
+tools/      selftest.py 端到端自测 · health_check.py 索引体检 · e2e_check.py 调 MCP 取回存量向量的端到端验证 · bench_embed.py 性能基准 · compare_models.py 模型对比 · estimate.py 规模估算
             estimate.py 规模预估 · compare_models.py 模型取舍对比
 config.example.json  默认配置（含源库定义，提交进 git）
 config.json          本机配置（绝对路径，不进 git）
@@ -211,6 +214,25 @@ config.json          本机配置（绝对路径，不进 git）
 - **MCP 协议**：initialize 握手、tools/list 返回 6 个工具、六个工具调用全部成功、
   未知工具返回 JSON-RPC 错误不崩溃、exit 正常退出、stdout 无非协议污染。
 
+## 七之二、"直接调 kb-mcp 到底能不能拿到已经向量化的内容"
+
+能。`python tools\e2e_check.py` → **13/13**，走的是和 AionUi 完全同一条链路（stdio 子进程）：
+
+1. `initialize` → `tools/list`（6 个工具）→ `tools/call stats`：MCP 报回的
+   `chunks / embeddings / fts_rows` 与直连索引库只读打开后的计数**完全一致**（57,184 ×3）；
+2. `search` 结果里 **`fts_rank` 和 `vector_rank` 都真实填充**，不是摆设；
+3. 挑一条 `fts_rank=null`、`vector_rank=1` 的结果 —— 全文侧前 200 名里根本没有它，
+   **只可能来自向量臂**；这类"仅向量命中"的结果占了前 50 名的 **127/300**；
+4. **终局举证**：用这条结果的 `chunk_id` 去 `embeddings` 表取出 blob，
+   手工复算 `cos(查询向量, 存量向量)` = **0.6679**，与 `search` 返回的 `cosine` 一致（差 4e-5，float32 舍入）
+   —— 命中确实来自库里**已经存好的**向量，而不是查询时重算或猜的；
+5. 把 embedder 换成 `available=False`，`mode` 立刻降为 `fts`、向量候选为 0，
+   `notes` 明说「向量检索不可用（…）」——**不会假装命中**。
+
+顺带一个坑：自己手工复算余弦时，查询必须加上 `embed.query_prefix`
+（`为这个句子生成表示以用于检索相关文章：`，bge 中文官方指令；索引侧 `doc_prefix` 是空串）。
+不加前缀算出来是 0.7120，会让人误以为是 bug —— 这是**检索端非对称前缀**，是对的。
+
 ## 八、健壮性：几处"看起来没事、其实会咬人"的地方
 
 | 场景 | 行为 |
@@ -229,6 +251,10 @@ config.json          本机配置（绝对路径，不进 git）
 | 一篇长对话的相邻片段挤满结果 | 默认同一篇**最多保留 2 个片段**（`search.max_per_doc`），腾出位置给别篇；被折叠的条数会写在 `notes` 里 |
 | 想问"最近讲了什么" | `search(sort="recent")` 按出片时间倒序，新内容不会被历史高分篇目盖住 |
 | `top_k: "abc"`、未知 `mode`、未知 `source` | 参数容错（钳位/回退 hybrid/明确报错），不把 Python 异常泄漏给调用方 |
+| 向量模型没加载出来 | `mode` 降为 `fts`，`notes` 只说「向量检索不可用（原因）」；**不会**再说「索引尚未补齐」——那是另一码事，说错了会把「模型没加载」误导成「库没建好」 |
 
 `python tools/health_check.py` 是只读体检（11 项）：片段与全文行数一致、无孤儿全文行、
 每个片段都有向量、维度/范数统一、向量只来自一个模型、HEAD 与索引时一致、与源库无差异。
+
+`python tools/e2e_check.py` 是调用链体检（13 项）：走真 MCP stdio 问 stats/search，
+把「MCP 报回的库」与「直连索引库」对账，再用手工复算余弦证明命中的是存量向量（见七之二）。

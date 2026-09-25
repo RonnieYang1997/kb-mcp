@@ -138,11 +138,13 @@ def search(conn, cfg: dict, query: str, embedder=None, top_k: int | None = None,
         fts_rows, note = fts_search(conn, query, fts_lim, where, params, scfg.get("max_terms", 16))
         if note:
             notes.append(note)
+    vec_tried = False   # 向量臂到底有没有真的跑过：决定后面那句 note 该不该说
     if mode in ("hybrid", "vector"):
         if embedder is not None and getattr(embedder, "available", False):
             prefix = cfg.get("embed", {}).get("query_prefix", "")
             qvec = embedder.encode([query], prefix=prefix)[0]
             vec_rows = vector_search(conn, qvec, vec_lim, where, params)
+            vec_tried = True
         else:
             notes.append("向量检索不可用（" + (getattr(embedder, "reason", "未加载") if embedder else "未加载") + "）")
 
@@ -221,7 +223,11 @@ def search(conn, cfg: dict, query: str, embedder=None, top_k: int | None = None,
     else:
         effective = mode + "(no-hit)"
     if mode == "hybrid" and not vec_rows and fts_rows:
-        notes.append("向量检索暂无可比数据（索引尚未补齐），本次结果全部来自全文检索")
+        if vec_tried:
+            # 向量臂跑过了但一条候选都没有 —— 这才是「索引还没补齐」
+            notes.append("向量检索没有可比数据（向量索引尚未补齐），本次结果全部来自全文检索")
+        # 向量臂没跑（模型不可用）时不补这句：上面已经说清原因了，
+        # 再说「索引尚未补齐」会把「模型没加载」误导成「库没建好」
     return {
         "query": query,
         "mode": effective,
