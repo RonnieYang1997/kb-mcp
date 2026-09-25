@@ -12,6 +12,12 @@ from pathlib import Path
 from . import __version__, audit, config as cfgmod, embed as embed_mod, indexer, store, textproc
 
 
+def _force_utf8_when_piped() -> None:
+    """兼容旧调用点；实现搬到了 kb.console（selftest / health_check 也用同一份）。"""
+    from .console import force_utf8_when_piped
+    force_utf8_when_piped()
+
+
 def _out(obj, as_json: bool = False, text: str = "") -> None:
     if as_json:
         print(json.dumps(obj, ensure_ascii=False, indent=2))
@@ -141,6 +147,83 @@ def cmd_fetch(args) -> int:
                       "total_chars": len(body), "returned_chars": len(piece)}, ensure_ascii=False))
     print(piece)
     return 0
+
+
+def cmd_verify_quote(args) -> int:
+    """核对一条（或多条）引文是否在原文里逐字存在。"""
+    from . import verify as verify_mod
+    cfg = cfgmod.load()
+    conn = _open_store(cfg)
+    quotes = list(args.quote or [])
+    if args.file:
+        data = Path(args.file).read_text(encoding="utf-8", errors="replace")
+        found = [q["quote"] for q in verify_mod.extract_quotes(data)]
+        if not found:
+            print("文稿里没找到带引号的引文（用「」『』“”包起来的片段）", file=sys.stderr)
+            return 1
+        quotes += found
+    if not quotes:
+        print("请给出引文，或用 --file 指定一篇 Markdown 文稿", file=sys.stderr)
+        return 1
+    res = verify_mod.verify_quotes(conn, cfg, quotes, bvid=args.bvid,
+                                   fuzzy=not args.no_fuzzy,
+                                   context_chars=args.context)
+    if args.json:
+        _out(res, True)
+    else:
+        for it in res["results"]:
+            mark = "OK " if it["ok"] else "!! "
+            print(f"{mark}[{it['status']}] {it['verdict']}")
+            print(f"    {it['quote'][:110]}")
+            if it.get("bvid"):
+                print(f"    出处：{it['bvid']} {it.get('title') or ''} offset={it.get('offset')}")
+            for n in (it.get("notes") or []):
+                print(f"    · {n}")
+            if it.get("matched_text") and not it["ok"]:
+                print(f"    原文实际：{it['matched_text'][:160]}")
+            for s in (it.get("suggestions") or [])[:2]:
+                print(f"    建议({s['ratio']})：{s['text'][:160]}")
+        print(f"\n合计 {res['total']} 条：逐字 {res['verbatim']}、警告 {res['warn']}、"
+              f"实质不符 {res['modified']}、失败 {res['failed']}")
+    bad = [i for i in res["results"] if not i["ok"]]
+    if bad and args.strict:
+        return 5
+    return 0
+
+
+def cmd_verify_article(args) -> int:
+    """核对整篇 Markdown 文稿里的所有引文。"""
+    from . import verify as verify_mod
+    path = Path(args.path)
+    if not path.exists():
+        print(f"文件不存在：{path}", file=sys.stderr)
+        return 1
+    data = path.read_text(encoding="utf-8", errors="replace")
+    cfg = cfgmod.load()
+    conn = _open_store(cfg)
+    res = verify_mod.verify_article(conn, cfg, data, bvid=args.bvid,
+                                    fuzzy=not args.no_fuzzy, context_chars=args.context)
+    if args.json:
+        _out(res, True)
+    else:
+        if not res["results"]:
+            print(res.get("note", "文稿里没找到引文"))
+            return 0
+        for it in res["results"]:
+            mark = "OK " if it["ok"] else "!! "
+            print(f"{mark}第 {it.get('line')} 行 [{it['status']}] {it['verdict']}")
+            print(f"    {it['quote'][:110]}")
+            for n in (it.get("notes") or []):
+                print(f"    · {n}")
+            if it.get("matched_text") and it["status"] in ("modified",):
+                print(f"    原文实际：{it['matched_text'][:160]}")
+            if it.get("suggestions"):
+                s = it["suggestions"][0]
+                print(f"    建议({s['ratio']}) {s.get('bvid')}：{s['text'][:160]}")
+        print(f"\n{path.name}：共 {res['total']} 条引文，逐字 {res['verbatim']}、"
+              f"警告 {res['warn']}、实质不符 {res['modified']}、失败 {res['failed']}"
+              f" → {'全部通过' if res['ok'] else '有引文需要修改'}")
+    return 0 if res["ok"] else 5
 
 
 def cmd_stats(args) -> int:
@@ -276,6 +359,7 @@ def cmd_doctor(args) -> int:
 
 
 def main(argv=None) -> int:
+    _force_utf8_when_piped()
     ap = argparse.ArgumentParser(prog="kb", description=f"kb-mcp {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -313,6 +397,26 @@ def main(argv=None) -> int:
     sub.add_parser("sources", help="列出资料库").set_defaults(fn=cmd_sources)
     sub.add_parser("verify", help="只读体检：统计缺陷残留").set_defaults(fn=cmd_verify)
     sub.add_parser("doctor", help="环境与只读自审").set_defaults(fn=cmd_doctor)
+
+    p = sub.add_parser("verify-quote", aliases=["vq"],
+                       help="核对引文是否在原文里逐字存在（引用前必做）")
+    p.add_argument("quote", nargs="*", help="要核对的引文，可以给多条")
+    p.add_argument("--bvid", help="把引文限定在这一篇里核对")
+    p.add_argument("--file", help="也可以把一篇 Markdown 文稿里的引文都抽出来核对")
+    p.add_argument("--context", type=int, default=90, help="命中的上下文长度，默认 90")
+    p.add_argument("--no-fuzzy", action="store_true", help="查不到时不给相近建议")
+    p.add_argument("--strict", action="store_true", help="有引文没通过就以退出码 5 结束")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_verify_quote)
+
+    p = sub.add_parser("verify-article", aliases=["va"],
+                       help="核对整篇 Markdown 文稿里的所有引文")
+    p.add_argument("path", help="Markdown 文稿路径")
+    p.add_argument("--bvid", help="把所有引文都限定在这一篇里核对")
+    p.add_argument("--context", type=int, default=90)
+    p.add_argument("--no-fuzzy", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_verify_article)
 
     p = sub.add_parser("add-source", help="增加资料库（口子）")
     p.add_argument("--root", required=True)

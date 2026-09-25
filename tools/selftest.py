@@ -19,6 +19,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 REPO = Path(r"C:\Users\Ronnie\Documents\GitHub\dufuzhixin")
+sys.path.insert(0, str(ROOT))
+from kb.console import force_utf8_when_piped       # noqa: E402
+force_utf8_when_piped()
 FAILS: list[str] = []
 PASSES: list[str] = []
 
@@ -235,6 +238,60 @@ def main() -> int:
         back = indexer.index_source(conn, cfg, cfg["sources"][0], embedder=emb, full=False)
         check(back["model_mismatch"] is False, "模型标识恢复正常后不再告警")
 
+    print("\n== 6d. 引文核对（引用前必做的那一步） ==")
+    from kb import verify as verify_mod
+    probe = None
+    for off in range(0, max(1, len(body) - 60), 13):
+        cand = body[off:off + 42].strip()
+        if len(verify_mod._tight(cand)) >= verify_mod.MIN_QUOTE_CHARS and "\n" not in cand:
+            probe = cand
+            break
+    if probe:
+        r_ok = verify_mod.verify_quote(conn, cfg, probe, doc_id=doc["id"])
+        check(r_ok["status"] == "verbatim" and r_ok["ok"] and r_ok["matched_text"] == probe,
+              "原文原句 → verbatim（可引用）", f"{r_ok['status']} 「{probe[:18]}」")
+        mut = probe[:9] + ("这" if probe[9:10] != "这" else "那") + probe[10:]
+        r_mut = verify_mod.verify_quote(conn, cfg, mut, doc_id=doc["id"])
+        check(not r_mut["ok"], "改一个字 → 判不通过（绝不放过改字）",
+              f"{r_mut['status']} 建议={len(r_mut['suggestions'])}")
+        ins = probe[:11] + "（补充）" + probe[11:]
+        r_ins = verify_mod.verify_quote(conn, cfg, ins, doc_id=doc["id"])
+        check(r_ins["status"] == "annotated" and r_ins["ok"]
+              and r_ins["annotations"], "作者加的括注 → annotated（文字一致但标出来）",
+              f"{r_ins['annotations']}")
+        r_g = verify_mod.verify_quote(conn, cfg, probe)
+        check(r_g["status"] == "verbatim" and r_g["doc_id"] == doc["id"],
+              "不给出处时全库也能定位到同一篇")
+        r_two, _had = verify_mod.split_ellipsis(probe[:20] + "……" + probe[-20:])
+        check(len(r_two) == 2, "省略号引文被拆成 2 段分别核对")
+        r_el = verify_mod.verify_quotes(conn, cfg, [probe[:20] + "……" + probe[-20:]])
+        check(r_el["results"][0]["had_ellipsis"]
+              and len(r_el["results"][0]["fragments"]) == 2,
+              "批量核对时省略号引文也拆段")
+
+    r_bad = verify_mod.verify_quote(conn, cfg, "  。。 ")
+    check(r_bad["status"] == "error", "空/纯标点引文 → error（不返回随机结果）")
+    r_nobv = verify_mod.verify_quote(conn, cfg, "一段编造的话用于测试核对", bvid="BV1zzzzzzzzz")
+    check(r_nobv["status"] == "error" and "BV1zzzzzzzzz" in (r_nobv["notes"] or [""])[0],
+          "不存在的 bvid → error 并提示（不静默编造）")
+    r_inv = verify_mod.verify_quote(conn, cfg, "这段话说的是完全没有的东西啊", doc_id=999999)
+    check(r_inv["status"] == "error", "不存在的 doc_id → error")
+
+    # 跨片段边界：只查索引会假阴性，所以核对必须回原文
+    long_doc = src_dir / "dufu-BVlong0001.md"
+    # 每段内容都不一样——否则周期性文本会在别的偏移处"重演"，测不出跨块
+    long_body = "".join(f"第{i}号测试段落，用于验证跨片段核对。" for i in range(120))
+    long_doc.write_text("---\ntitle: 长文测试\ndescription: 2026-09-25\n---\n\n" + long_body,
+                        encoding="utf-8")
+    indexer.index_source(conn, cfg, cfg["sources"][0], embedder=emb, full=False)
+    lrow = conn.execute("SELECT id FROM docs WHERE rel_path LIKE '%long0001%'").fetchone()
+    if lrow:
+        cross = long_body[400:800]      # 400 字 > 单块 350 字，必然不在任何单个片段里
+        r_cross = verify_mod.verify_quote(conn, cfg, cross, doc_id=lrow["id"])
+        check(r_cross["status"] == "verbatim" and r_cross["in_chunk"] is False,
+              "跨片段长句：原文能核对到，但不在任何单个片段里（索引侧假阴性）",
+              f"{r_cross['status']} in_chunk={r_cross['in_chunk']}")
+
     print("\n== 7. 源库未被改动（三重证据） ==")
     left = [(p, sha1(p) != src_sha_before[p]) for p in fx["source_files"]]
     check(not any(ch for _, ch in left), "被复制的源文件 sha1 未变",
@@ -271,8 +328,8 @@ def main() -> int:
     proc.stdin.flush()
     r2 = rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     names = [t["name"] for t in r2["result"]["tools"]] if r2 else []
-    check(names == ["search", "fetch", "list_documents", "stats", "reindex"],
-          f"tools/list 返回 5 个工具 {names}")
+    check(names == ["search", "fetch", "verify_quotes", "list_documents", "stats", "reindex"],
+          f"tools/list 返回 6 个工具 {names}")
     r3 = rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
               "params": {"name": "search", "arguments": {"query": "语音转录", "top_k": 3}}})
     ok3 = bool(r3 and not r3["result"]["isError"])
@@ -293,6 +350,15 @@ def main() -> int:
     r7 = rpc({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
               "params": {"name": "不存在的工具", "arguments": {}}})
     check(bool(r7 and "error" in r7), "未知工具返回 JSON-RPC 错误而非崩溃")
+    r8 = rpc({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+              "params": {"name": "verify_quotes",
+                         "arguments": {"quotes": ["语音转录"]}}})
+    ok8 = bool(r8 and not r8["result"]["isError"])
+    check(ok8, "tools/call verify_quotes 成功")
+    if ok8:
+        v = json.loads(r8["result"]["content"][0]["text"])["data"]
+        check(v["total"] == 1 and "status" in v["results"][0],
+              f"verify_quotes 返回结果 {v['results'][0]['status']}")
     proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "exit"}) + "\n")
     proc.stdin.flush()
     try:

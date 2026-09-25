@@ -18,7 +18,8 @@ import time
 import traceback
 from pathlib import Path
 
-from . import __version__, config as cfgmod, embed as embed_mod, indexer, search as search_mod, store
+from . import (__version__, config as cfgmod, embed as embed_mod, indexer,
+               search as search_mod, store, verify)
 
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL = "2024-11-05"
@@ -70,7 +71,9 @@ def tool_defs() -> list[dict]:
                             "返回带出处的片段：标题/日期/BVID/文件路径/片段序号，"
                             "每条结果都带 chunk_id 与 doc_id。"
                             "同一篇对话最多出现 2 个片段（避免一篇刷屏），要看完整上下文就把 "
-                            "chunk_id 交给 fetch（会自动对准命中位置）。"),
+                            "chunk_id 交给 fetch（会自动对准命中位置）。"
+                            "⚠ 这里返回的是**清洗过、切块过**的文本，可能被截断或跨片段；"
+                            "要把它当引文写进成品前，必须先用 verify_quotes 回原文逐字核对。"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -93,7 +96,9 @@ def tool_defs() -> list[dict]:
             "description": ("取一篇转录的完整正文（已做只读清洗），用于整理与总结。"
                             "最常用：把 search 结果里的 chunk_id 丢进来，会自动定位到该片段所在文档、"
                             "并把返回窗口对准命中位置（前后各留上下文）。也支持 doc_id / 路径 / BVID。"
-                            "大文件可配合 offset/max_chars 分段取。"),
+                            "大文件可配合 offset/max_chars 分段取。"
+                            "⚠ 正文虽已清洗但仍是原文流，摘引时请照样用 verify_quotes 回原文核对"
+                            "（清洗会丢掉乱码表头，切块会把长句截断）。"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -105,6 +110,34 @@ def tool_defs() -> list[dict]:
                     "offset": {"type": "integer", "description": "从第几个字符开始，默认 0"},
                     "max_chars": {"type": "integer", "description": "最多返回多少字，默认 20000"},
                 },
+            },
+        },
+        {
+            "name": "verify_quotes",
+            "description": ("【引用前必做】把「我要引用的这句话」拿回**只读源文件原文**逐字核对。"
+                            "search/fetch 返回的是清洗过、切块过的文本——可能被截断、错拼，"
+                            "或跨了片段边界；直接把片段当引文写进成品会出假引文。"
+                            "本工具用 FTS 定位候选，但**判定一律回到源文件正文**。"
+                            "返回每条引文的状态：verbatim（逐字一致，可引用）/ whitespace（仅空白差异）/"
+                            "annotated（文字一致但你插了原文没有的括注）/ loose（仅标点差异）/"
+                            "modified（多字/少字/改字，给了 matched_text 和差异列表）/"
+                            "not_in_body（只在乱码表头或元数据区，不能引）/ not_found（查不到，"
+                            "会给最接近的原文建议）。引文含省略号时会自动拆段分别核对。"),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "quotes": {
+                        "description": "要核对的引文：可以是字符串数组，"
+                                       "也可以是对象数组（每项 {\"quote\": \"...\", \"bvid\": \"BV...\"}）",
+                        "type": "array",
+                        "items": {"anyOf": [{"type": "string"}, {"type": "object"}]},
+                    },
+                    "bvid": {"type": "string", "description": "可选：把本批引文都限定在这一篇里"},
+                    "doc_id": {"type": "integer", "description": "可选：同上，按 doc_id 限定"},
+                    "fuzzy": {"type": "boolean", "description": "查不到时是否给最接近的原文建议，默认 true"},
+                    "context_chars": {"type": "integer", "description": "命中时前后留多少字上下文，默认 90"},
+                },
+                "required": ["quotes"],
             },
         },
         {
@@ -237,19 +270,13 @@ def _resolve_doc(conn, doc_id=None, path=None, bvid=None) -> dict | None:
 
 
 def _doc_text(cfg, src_id: str, abs_path: str) -> str:
-    """重新只读读取并清洗正文（索引库存的是片段，全文本这里现取）。"""
-    from . import textproc
-    with open(abs_path, "rb") as f:      # 只读
-        raw = f.read()
-    text = raw.decode("utf-8", errors="replace")
-    meta, body, _ = textproc.parse_front_matter(text)
-    m = textproc.extract_meta(meta, body, os.path.basename(abs_path))
-    clean = True
-    for s in cfg.get("sources", []):
-        if s["id"] == src_id:
-            clean = bool(s.get("clean", True))
-    body_clean, _stats = textproc.clean_body(body, m["title"], clean)
-    return body_clean, m
+    """重新只读读取并清洗正文（索引库存的是片段，全文本这里现取）。
+
+    清洗流程与 verify.load_source_text 共用同一份实现——
+    这样"fetch 看到的文本"和"引文核对时的基准"永远是同一套口径。
+    """
+    body, m, _raw = verify.load_source_text(cfg, src_id, abs_path)
+    return body, m
 
 
 def t_search(ctx: Ctx, args: dict) -> dict:
@@ -323,6 +350,33 @@ def t_fetch(ctx: Ctx, args: dict) -> dict:
         "returned_chars": len(piece), "has_more": offset + max_chars < len(body),
         "text": piece,
     }
+
+
+def t_verify_quotes(ctx: Ctx, args: dict) -> dict:
+    """引用前核对：把引文拿回只读原文逐字对一遍。"""
+    quotes = args.get("quotes")
+    if isinstance(quotes, str):
+        quotes = [quotes]
+    if not isinstance(quotes, list):
+        return {"ok": False, "error": "quotes 必须是字符串或数组",
+                "hint": "quotes: [\"引文1\", {\"quote\": \"引文2\", \"bvid\": \"BV1...\"}]"}
+    if not quotes:
+        return {"ok": False, "error": "quotes 为空"}
+    if len(quotes) > 50:
+        return {"ok": False, "error": "一次最多核对 50 条引文",
+                "hint": f"收到 {len(quotes)} 条，请分批"}
+    bvid = args.get("bvid")
+    if bvid:
+        bvid = str(bvid).strip()
+    doc_id = args.get("doc_id")
+    res = verify.verify_quotes(
+        ctx.conn, ctx.cfg, quotes, bvid=bvid, doc_id=doc_id,
+        fuzzy=_as_bool(args.get("fuzzy"), True),
+        context_chars=_as_int(args.get("context_chars"), 90, 0, 2000))
+    res["advice"] = ("全部逐字一致，可以引用。" if res["ok"] else
+                     "有引文没通过：请照 matched_text / suggestions 里的原文改写，"
+                     "不要自己顺句子。")
+    return res
 
 
 def t_list_documents(ctx: Ctx, args: dict) -> dict:
@@ -460,8 +514,8 @@ def t_reindex(ctx: Ctx, args: dict) -> dict:
             "error_files": [x for r in runs for x in r.get("error_files", [])][:50]}
 
 
-TOOLS = {"search": t_search, "fetch": t_fetch, "list_documents": t_list_documents,
-         "stats": t_stats, "reindex": t_reindex}
+TOOLS = {"search": t_search, "fetch": t_fetch, "verify_quotes": t_verify_quotes,
+         "list_documents": t_list_documents, "stats": t_stats, "reindex": t_reindex}
 
 
 # ---------- JSON-RPC ----------

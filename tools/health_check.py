@@ -21,6 +21,9 @@ sys.path.insert(0, str(ROOT))
 
 from kb import config as cfgmod      # noqa: E402
 from kb import indexer, store        # noqa: E402
+from kb.console import force_utf8_when_piped   # noqa: E402
+
+force_utf8_when_piped()
 
 OK, WARN, BAD = "  ok  ", " warn ", " BAD  "
 rows: list[tuple[str, str, str]] = []
